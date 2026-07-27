@@ -1,0 +1,38 @@
+# ==========================================
+# Datasets & Large Data Directories
+# ==========================================
+preprocessed_data/
+*.zip
+
+# Medical Imaging Data & Slice Files
+*.dcm
+*.nii
+*.nii.gz
+*.npz
+
+# ==========================================
+# Python & Virtual Environments
+# ==========================================
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+ENV/
+env/
+build/
+dist/
+*.egg-info/
+
+# ==========================================
+# Logs & Generated Output Files
+# ==========================================
+*.log
+
+# ==========================================
+# IDE & System Files
+# ==========================================
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
