@@ -12,7 +12,7 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 from matplotlib.path import Path
 from scipy.ndimage import binary_fill_holes
 
-def build_xml_index(datasetmare_dir):
+def build_xml_index(datasetmare_dir=r"E:\CS2023-2027\AIMAS\practica\datasetmare"):
     """
     Indexes XML files in datasetmare by StudyInstanceUID, SeriesInstanceUID, and imageSOP_UIDs.
     """
@@ -28,7 +28,7 @@ def build_xml_index(datasetmare_dir):
     index = {'study': {}, 'series': {}, 'sop': {}}
     ns = {'nih': 'http://www.nih.gov'}
 
-    print(f"Indexing {len(xml_files)} XML annotation files...")
+    print(f"Indexing {len(xml_files)} XML annotation files from {xml_dir}...")
     for xf in xml_files:
         try:
             tree = ET.parse(xf)
@@ -55,11 +55,16 @@ def build_xml_index(datasetmare_dir):
     print(f"XML Index ready: {len(index['study'])} studies, {len(index['sop'])} SOPs.")
     return index
 
-def load_patient_dicom_and_xml(patient_id, datasetmare_dir="datasetmare", xml_index=None):
+def load_patient_dicom_and_xml(patient_id, datasetmare_dir=r"E:\CS2023-2027\AIMAS\practica\datasetmare", xml_index=None):
     """
     Loads raw DICOM volume for a patient and matches its XML expert annotation file.
     """
     lidc_dir = os.path.join(datasetmare_dir, "lidc_idri")
+    if not os.path.exists(lidc_dir):
+        lidc_dir = datasetmare_dir
+
+
+
 
     clean_id = os.path.basename(patient_id.strip('/\\'))
     if not clean_id.startswith("LIDC-IDRI-"):
@@ -204,7 +209,8 @@ def normalize_lung_window(hu_volume, min_hu=-1000.0, max_hu=400.0):
     normalized = (clipped - min_hu) / (max_hu - min_hu)
     return normalized.astype(np.float32)
 
-def process_single_patient(patient_id, datasetmare_dir="datasetmare", output_dir="preprocessed_data", xml_index=None, min_air_ratio=0.05, neg_pos_ratio=1.5, max_neg_slices=20):
+def process_single_patient(patient_id, datasetmare_dir=r"E:\CS2023-2027\AIMAS\practica\datasetmare", output_dir="preprocessed_data", xml_index=None, min_air_ratio=0.05, neg_pos_ratio=1.5, max_neg_slices=20):
+
     """
     Preprocesses a single patient:
     - Normalizes CT HU volume
@@ -364,25 +370,28 @@ def main():
     parser.add_argument("--patient", "-p", type=str, default=None, help="Single Patient ID to process (e.g. LIDC-IDRI-0001)")
     parser.add_argument("--all", "-a", action="store_true", help="Process ALL patients in datasetmare")
     parser.add_argument("--max_patients", type=int, default=None, help="Limit total number of patients to process")
-    default_workers = min(6, max(1, os.cpu_count() or 4))
-    parser.add_argument("--num_workers", "-w", type=int, default=default_workers, help="Number of parallel CPU worker processes (defaults to safe RAM limit of 6)")
-    parser.add_argument("--datasetmare_dir", type=str, default="datasetmare", help="Path to datasetmare directory")
+    parser.add_argument("--num_workers", "-w", type=int, default=8, help="Number of parallel CPU worker processes (defaults to safe RAM limit of 6)")
+    parser.add_argument("--datasetmare_dir", type=str, default=r"E:\CS2023-2027\AIMAS\practica\datasetmare", help="Path to dataset directory (default: E:\\CS2023-2027\\AIMAS\\practica\\datasetmare)")
     parser.add_argument("--output_dir", type=str, default="preprocessed_data", help="Output directory for .npz files")
     parser.add_argument("--preview", action="store_true", default=False, help="Save visual verification preview image")
 
     args = parser.parse_args()
 
     xml_index = build_xml_index(args.datasetmare_dir)
+
     lidc_dir = os.path.join(args.datasetmare_dir, "lidc_idri")
+    if not os.path.exists(lidc_dir):
+        lidc_dir = args.datasetmare_dir
 
     if args.patient:
-        patient_dirs = [os.path.join(lidc_dir, args.patient)]
+        patient_dirs = [p for p in [os.path.join(lidc_dir, args.patient)] if os.path.isdir(p)]
     else:
-        patient_dirs = sorted(glob.glob(os.path.join(lidc_dir, "LIDC-IDRI-*")))
+        patient_dirs = [p for p in sorted(glob.glob(os.path.join(lidc_dir, "LIDC-IDRI-*"))) if os.path.isdir(p)]
 
     if not patient_dirs:
         print(f"No patient directories found in {lidc_dir}")
         return
+
 
     if args.max_patients:
         patient_dirs = patient_dirs[:args.max_patients]
