@@ -1,13 +1,24 @@
+# Standard library
 import os
 import sys
 import glob
 import argparse
 import xml.etree.ElementTree as ET
-import numpy as np
+
+# Windows-specific environment configuration
+if sys.platform == "win32":
+    os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
+
+# 3rd party
 import pydicom
+import numpy as np
 import matplotlib.pyplot as plt
-from matplotlib.widgets import Slider, Button, RadioButtons, CheckButtons
 from matplotlib.path import Path
+from matplotlib.widgets import Slider, Button, RadioButtons, CheckButtons
+
+# Default Configuration Constants
+DEFAULT_DATASET_DIR = "dataset"
+DEFAULT_PATIENT_ID = "LIDC-IDRI-0001"
 
 def build_xml_index(datasetmare_dir):
     """
@@ -492,16 +503,16 @@ def list_lidc_patients(datasetmare_dir="datasetmare"):
 
 def main():
     parser = argparse.ArgumentParser(description="Visualize LIDC-IDRI DICOM CT Scans and Expert Radiologist XML Annotations")
-    parser.add_argument("--patient", "-p", type=str, default="LIDC-IDRI-0001", help="Patient ID (e.g. LIDC-IDRI-0001, 0001, 1)")
+    parser.add_argument("--patient", "-p", type=str, default=DEFAULT_PATIENT_ID, help=f"Patient ID (default: {DEFAULT_PATIENT_ID})")
     parser.add_argument("--save", "-s", action="store_true", help="Save multi-view grid preview PNG image to disk")
     parser.add_argument("--out", "-o", type=str, default=None, help="Output image file path")
     parser.add_argument("--list", "-l", action="store_true", help="List all available patients in datasetmare")
     args = parser.parse_args()
 
     base_dir = os.path.dirname(os.path.abspath(__file__))
-    datasetmare_dir = os.path.join(base_dir, "datasetmare")
+    datasetmare_dir = os.path.join(base_dir, DEFAULT_DATASET_DIR)
     if not os.path.exists(datasetmare_dir):
-        datasetmare_dir = "datasetmare"
+        datasetmare_dir = DEFAULT_DATASET_DIR
 
     if args.list:
         list_lidc_patients(datasetmare_dir)

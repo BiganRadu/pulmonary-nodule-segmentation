@@ -1,12 +1,11 @@
-import torch
+# Standard library
 import os
 import sys
+import argparse
 
-# Windows OpenMP duplicate library handling
-os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
-
-# Windows PyTorch DLL initialization fix (prevents OSError WinError 1114)
+# Windows-specific environment configuration
 if sys.platform == "win32":
+    os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
     torch_lib_dir = os.path.join(os.path.dirname(sys.executable), "Lib", "site-packages", "torch", "lib")
     if os.path.exists(torch_lib_dir):
         if torch_lib_dir not in os.environ.get("PATH", ""):
@@ -17,15 +16,23 @@ if sys.platform == "win32":
             except Exception:
                 pass
 
-import argparse
+# 3rd party
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 from matplotlib.widgets import Button
 from scipy.ndimage import label
 
+# PyTorch & MONAI
+import torch
 import monai
 from monai.networks.nets import AttentionUnet, UNet
+
+# Default Configuration Constants
+DEFAULT_PATIENT_ID = "LIDC-IDRI-0072"
+DEFAULT_MANIFEST = "preprocessed_data/dataset_manifest.csv"
+DEFAULT_MODEL_PATH = "models/attention_unet/attention_unet.pth"
+DEFAULT_MIN_SIZE = 30
 
 def remove_small_objects(binary_mask, min_size=30):
     """
@@ -259,10 +266,10 @@ class PatientSliceVisualizer:
 
 def main():
     parser = argparse.ArgumentParser(description="Interactive Patient 2D Slice Visualizer (CT vs Ground Truth vs MONAI UNet)")
-    parser.add_argument("--patient_id", type=str, default="LIDC-IDRI-0072", help="Patient ID to visualize (e.g. LIDC-IDRI-0001)")
-    parser.add_argument("--manifest", type=str, default="preprocessed_data/dataset_manifest.csv", help="Path to preprocessed dataset manifest CSV")
-    parser.add_argument("--model_path", type=str, default="best_model_2d.pth", help="Path to trained model checkpoint")
-    parser.add_argument("--min_size", type=int, default=30, help="Minimum connected component size (in pixels) to keep (default: 30)")
+    parser.add_argument("--patient_id", type=str, default=DEFAULT_PATIENT_ID, help=f"Patient ID to visualize (default: {DEFAULT_PATIENT_ID})")
+    parser.add_argument("--manifest", type=str, default=DEFAULT_MANIFEST, help=f"Path to preprocessed dataset manifest CSV (default: {DEFAULT_MANIFEST})")
+    parser.add_argument("--model_path", type=str, default=DEFAULT_MODEL_PATH, help=f"Path to trained model checkpoint (default: {DEFAULT_MODEL_PATH})")
+    parser.add_argument("--min_size", type=int, default=DEFAULT_MIN_SIZE, help=f"Minimum connected component size (in pixels) to keep (default: {DEFAULT_MIN_SIZE})")
 
     args = parser.parse_args()
 

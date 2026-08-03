@@ -1,7 +1,10 @@
+# Standard library
 import os
 import sys
+import argparse
+import multiprocessing
 
-# Windows PyTorch DLL initialization fix (prevents OSError WinError 1114)
+# Windows-specific environment configuration
 if sys.platform == "win32":
     os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
     torch_lib_dir = os.path.join(os.path.dirname(sys.executable), "Lib", "site-packages", "torch", "lib")
@@ -14,24 +17,31 @@ if sys.platform == "win32":
             except Exception:
                 pass
 
-import torch
-from torch.utils.data import DataLoader
-
-import os
-import sys
-import argparse
+# 3rd party
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 from scipy.ndimage import label
 
-import monai
-from monai.networks.nets import AttentionUnet, UNet
+# PyTorch & MONAI
+import torch
+from torch.utils.data import DataLoader
 from monai.metrics import DiceMetric
-from train_monai_2d import LIDC2DDataset, get_transforms
+from monai.networks.nets import AttentionUnet, UNet
+
+# Local imports
+from train import LIDC2DDataset, get_transforms
+
+# Default Configuration Constants
+DEFAULT_MANIFEST = "preprocessed_data/dataset_manifest.csv"
+DEFAULT_MODEL_PATH = "models/attention_unet/attention_unet.pth"
+DEFAULT_BATCH_SIZE = 32
+DEFAULT_NUM_WORKERS = 8
+DEFAULT_MIN_SIZE = 30
+DEFAULT_OUTPUT_PREVIEW = "test_predictions_preview.png"
 
 
-def remove_small_objects(binary_mask, min_size=30):
+def remove_small_objects(binary_mask, min_size=DEFAULT_MIN_SIZE):
     """
     Removes connected components in binary_mask that have fewer than min_size pixels.
     Eliminates small false positive noise predictions.
@@ -160,13 +170,12 @@ def save_visual_predictions(model, test_dataset, device, output_path="test_predi
 
 def main():
     parser = argparse.ArgumentParser(description="Evaluate Trained MONAI 2D UNet Model on Test Set")
-    default_workers = min(4, os.cpu_count() or 2)
-    parser.add_argument("--manifest", type=str, default="preprocessed_data/dataset_manifest.csv", help="Path to manifest CSV")
-    parser.add_argument("--model_path", type=str, default="attention_unet.pth", help="Path to trained model checkpoint")
-    parser.add_argument("--batch_size", type=int, default=32, help="Batch size for evaluation")
-    parser.add_argument("--num_workers", type=int, default=default_workers, help=f"DataLoader num_workers (default: {default_workers})")
-    parser.add_argument("--min_size", type=int, default=30, help="Minimum connected component size (in pixels) to keep (default: 30)")
-    parser.add_argument("--output_preview", type=str, default="test_predictions_preview.png", help="Path for prediction PNG")
+    parser.add_argument("--manifest", type=str, default=DEFAULT_MANIFEST, help=f"Path to manifest CSV (default: {DEFAULT_MANIFEST})")
+    parser.add_argument("--model_path", type=str, default=DEFAULT_MODEL_PATH, help=f"Path to trained model checkpoint (default: {DEFAULT_MODEL_PATH})")
+    parser.add_argument("--batch_size", type=int, default=DEFAULT_BATCH_SIZE, help=f"Batch size for evaluation (default: {DEFAULT_BATCH_SIZE})")
+    parser.add_argument("--num_workers", type=int, default=DEFAULT_NUM_WORKERS, help=f"DataLoader num_workers (default: {DEFAULT_NUM_WORKERS})")
+    parser.add_argument("--min_size", type=int, default=DEFAULT_MIN_SIZE, help=f"Minimum connected component size (in pixels) to keep (default: {DEFAULT_MIN_SIZE})")
+    parser.add_argument("--output_preview", type=str, default=DEFAULT_OUTPUT_PREVIEW, help=f"Path for prediction PNG (default: {DEFAULT_OUTPUT_PREVIEW})")
 
     args = parser.parse_args()
 
@@ -229,8 +238,8 @@ def main():
     save_visual_predictions(model, test_dataset, device, output_path=args.output_preview, min_size=args.min_size)
 
 if __name__ == "__main__":
-    import multiprocessing
-    multiprocessing.freeze_support()
+    if sys.platform == "win32":
+        multiprocessing.freeze_support()
     main()
 
 

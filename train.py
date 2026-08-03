@@ -1,11 +1,16 @@
+# Standard library
 import os
 import sys
+import time
 import random
+import argparse
 import multiprocessing
 
-# Windows PyTorch DLL initialization fix (prevents OSError WinError 1114)
+# Windows-specific environment configuration
 if sys.platform == "win32":
     os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
+    os.environ["OMP_NUM_THREADS"] = "1"
+    os.environ["MKL_NUM_THREADS"] = "1"
     torch_lib_dir = os.path.join(os.path.dirname(sys.executable), "Lib", "site-packages", "torch", "lib")
     if os.path.exists(torch_lib_dir):
         if torch_lib_dir not in os.environ.get("PATH", ""):
@@ -16,19 +21,17 @@ if sys.platform == "win32":
             except Exception:
                 pass
 
-import torch
-import torch.nn as nn
-from torch.utils.data import Dataset, DataLoader
-
-
-
-import time
-import argparse
+# 3rd party
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 from tqdm import tqdm
 from scipy.ndimage import label
+
+# PyTorch & MONAI
+import torch
+import torch.nn as nn
+from torch.utils.data import Dataset, DataLoader
 
 import monai
 from monai.networks.nets import UNet, AttentionUnet
@@ -43,9 +46,17 @@ from monai.transforms import (
     EnsureTyped
 )
 
-# Limit OpenMP/MKL threads per process to prevent CPU thread thrashing when using multiple loader workers on Windows
-os.environ["OMP_NUM_THREADS"] = "1"
-os.environ["MKL_NUM_THREADS"] = "1"
+# Default Configuration Constants
+DEFAULT_MANIFEST = "preprocessed_data/dataset_manifest.csv"
+DEFAULT_EPOCHS = 40
+DEFAULT_BATCH_SIZE = 64
+DEFAULT_LR = 1e-3
+DEFAULT_MIN_LR = 1e-5
+DEFAULT_VAL_MIN_SIZE = 30
+DEFAULT_WEIGHT_DECAY = 1e-4
+DEFAULT_NUM_WORKERS = 8
+DEFAULT_SAVE_PATH = "models/attention_unet/attention_unet.pth"
+DEFAULT_CHECKPOINT_PATH = "latest_checkpoint.pth"
 
 def remove_small_objects(binary_mask, min_size=30):
     """
@@ -66,9 +77,9 @@ def remove_small_objects(binary_mask, min_size=30):
 
 def worker_init_fn(worker_id):
     """
-    Worker initialization function for PyTorch DataLoaders on Windows.
+    Worker initialization function for PyTorch DataLoaders (Cross-platform: Linux & Windows).
     Ensures each worker process gets a unique random seed for Python, NumPy, and PyTorch,
-    preventing duplicate random data augmentations across spawn processes.
+    preventing duplicate random data augmentations across multi-process DataLoader workers.
     """
     worker_seed = (torch.initial_seed() + worker_id) % (2**32)
     np.random.seed(worker_seed)
@@ -245,17 +256,17 @@ def validate_epoch(model, loader, dice_metric, device, use_amp=True, val_min_siz
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Train 2D MONAI UNet Model on LIDC-IDRI Dataset (Accelerated AMP FP16 & Windows Multi-Worker)")
-    parser.add_argument("--manifest", type=str, default="preprocessed_data/dataset_manifest.csv", help="Path to master manifest CSV")
-    parser.add_argument("--epochs", type=int, default=40, help="Total target training epochs (e.g. 60 or 100)")
-    parser.add_argument("--batch_size", type=int, default=64, help="Batch size for training")
-    parser.add_argument("--lr", type=float, default=1e-3, help="Learning rate (default: 2e-4 for continuing/fine-tuning)")
-    parser.add_argument("--min_lr", type=float, default=1e-5, help="Minimum learning rate for scheduler (default: 1e-5)")
-    parser.add_argument("--val_min_size", type=int, default=30, help="Minimum connected component size (in pixels) to keep during validation Dice evaluation (default: 30)")
-    parser.add_argument("--weight_decay", type=float, default=1e-4, help="Weight decay for AdamW optimizer")
-    parser.add_argument("--num_workers", type=int, default=8, help=f"DataLoader num_workers (default: 8)")
-    parser.add_argument("--save_path", type=str, default="best_model_2d.pth", help="Path to save best model checkpoint")
-    parser.add_argument("--checkpoint_path", type=str, default="latest_checkpoint.pth", help="Path to save/load latest epoch checkpoint")
+    parser = argparse.ArgumentParser(description="Train 2D MONAI UNet Model on LIDC-IDRI Dataset (Accelerated AMP FP16 & Cross-Platform)")
+    parser.add_argument("--manifest", type=str, default=DEFAULT_MANIFEST, help=f"Path to master manifest CSV (default: {DEFAULT_MANIFEST})")
+    parser.add_argument("--epochs", type=int, default=DEFAULT_EPOCHS, help=f"Total target training epochs (default: {DEFAULT_EPOCHS})")
+    parser.add_argument("--batch_size", type=int, default=DEFAULT_BATCH_SIZE, help=f"Batch size for training (default: {DEFAULT_BATCH_SIZE})")
+    parser.add_argument("--lr", type=float, default=DEFAULT_LR, help=f"Learning rate (default: {DEFAULT_LR})")
+    parser.add_argument("--min_lr", type=float, default=DEFAULT_MIN_LR, help=f"Minimum learning rate for scheduler (default: {DEFAULT_MIN_LR})")
+    parser.add_argument("--val_min_size", type=int, default=DEFAULT_VAL_MIN_SIZE, help=f"Minimum connected component size (in pixels) during validation (default: {DEFAULT_VAL_MIN_SIZE})")
+    parser.add_argument("--weight_decay", type=float, default=DEFAULT_WEIGHT_DECAY, help=f"Weight decay for AdamW optimizer (default: {DEFAULT_WEIGHT_DECAY})")
+    parser.add_argument("--num_workers", type=int, default=DEFAULT_NUM_WORKERS, help=f"DataLoader num_workers (default: {DEFAULT_NUM_WORKERS})")
+    parser.add_argument("--save_path", type=str, default=DEFAULT_SAVE_PATH, help=f"Path to save best model checkpoint (default: {DEFAULT_SAVE_PATH})")
+    parser.add_argument("--checkpoint_path", type=str, default=DEFAULT_CHECKPOINT_PATH, help=f"Path to save/load latest epoch checkpoint (default: {DEFAULT_CHECKPOINT_PATH})")
     parser.add_argument("--resume", action="store_true", help="Resume training from latest checkpoint if available")
 
     args = parser.parse_args()
@@ -314,7 +325,7 @@ def main():
     num_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
 
     loss_fn = DiceFocalLoss(sigmoid=True, squared_pred=True, gamma=2.0)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay, fused=True)
     dice_metric = DiceMetric(include_background=True, reduction="mean")
     scaler = torch.cuda.amp.GradScaler() if device.type == "cuda" else None
 
@@ -415,5 +426,6 @@ def main():
     plot_training_history(history, save_path="training_history.png")
 
 if __name__ == "__main__":
-    multiprocessing.freeze_support()
+    if sys.platform == "win32":
+        multiprocessing.freeze_support()
     main()

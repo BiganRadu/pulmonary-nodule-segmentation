@@ -1,20 +1,32 @@
+# Standard library
 import os
 import sys
 import glob
 import argparse
 import xml.etree.ElementTree as ET
-import numpy as np
+from concurrent.futures import ProcessPoolExecutor, as_completed
+
+# 3rd party
+import cv2
 import pydicom
+import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
-import cv2
-from concurrent.futures import ProcessPoolExecutor, as_completed
 from matplotlib.path import Path
 from scipy.ndimage import binary_fill_holes
 
+# Default Configuration Constants
+DEFAULT_DATASET_DIR = "dataset"
+DEFAULT_OUTPUT_DIR = "preprocessed_data"
+DEFAULT_NUM_WORKERS = 8
+DEFAULT_MIN_AIR_RATIO = 0.05
+DEFAULT_NEG_POS_RATIO = 1.5
+DEFAULT_MAX_NEG_SLICES = 20
+
+
 def build_xml_index(dataset_dir):
     """
-    Indexes XML files in datasetmare by StudyInstanceUID, SeriesInstanceUID, and imageSOP_UIDs.
+    Indexes XML files in dataset by StudyInstanceUID, SeriesInstanceUID, and imageSOP_UIDs.
     """
     xml_dir = os.path.join(dataset_dir, "tcia-lidc-xml")
     if not os.path.exists(xml_dir):
@@ -204,7 +216,15 @@ def normalize_lung_window(hu_volume, min_hu=-1000.0, max_hu=400.0):
     normalized = (clipped - min_hu) / (max_hu - min_hu)
     return normalized.astype(np.float32)
 
-def process_single_patient(patient_id, dataset_dir="datasetmare", output_dir="preprocessed_data", xml_index=None, min_air_ratio=0.05, neg_pos_ratio=1.5, max_neg_slices=20):
+def process_single_patient(
+    patient_id,
+    dataset_dir=DEFAULT_DATASET_DIR,
+    output_dir=DEFAULT_OUTPUT_DIR,
+    xml_index=None,
+    min_air_ratio=DEFAULT_MIN_AIR_RATIO,
+    neg_pos_ratio=DEFAULT_NEG_POS_RATIO,
+    max_neg_slices=DEFAULT_MAX_NEG_SLICES
+):
     """
     Preprocesses a single patient:
     - Normalizes CT HU volume
@@ -365,10 +385,10 @@ def main():
     parser.add_argument("--all", "-a", action="store_true", help="Process ALL patients in datasetmare")
     parser.add_argument("--max_patients", type=int, default=None, help="Limit total number of patients to process")
 
-    parser.add_argument("--num_workers", "-w", type=int, default=8, help="Number of parallel CPU worker processes")
-    parser.add_argument("--dataset_dir", type=str, default=r"E:\CS2023-2027\AIMAS\practica\datasetmare", help="Path to dataset directory")
+    parser.add_argument("--num_workers", "-w", type=int, default=DEFAULT_NUM_WORKERS, help=f"Number of parallel CPU worker processes (default: {DEFAULT_NUM_WORKERS})")
+    parser.add_argument("--dataset_dir", type=str, default=DEFAULT_DATASET_DIR, help=f"Path to dataset directory (default: {DEFAULT_DATASET_DIR})")
 
-    parser.add_argument("--output_dir", type=str, default="preprocessed_data", help="Output directory for .npz files")
+    parser.add_argument("--output_dir", type=str, default=DEFAULT_OUTPUT_DIR, help=f"Output directory for .npz files (default: {DEFAULT_OUTPUT_DIR})")
     parser.add_argument("--preview", action="store_true", default=False, help="Save visual verification preview image")
 
     args = parser.parse_args()
