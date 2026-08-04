@@ -34,11 +34,11 @@ import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
 
 import monai
-from monai.networks.nets import UNet, AttentionUnet
-from monai.losses import DiceCELoss, DiceFocalLoss
-from monai.metrics import DiceMetric
+from monai.networks.nets import UNet
+from monai.losses import DiceFocalLoss
 from monai.transforms import (
     Compose,
+    Resized,
     RandRotated,
     RandFlipd,
     RandGaussianNoised,
@@ -47,16 +47,16 @@ from monai.transforms import (
 )
 
 # Default Configuration Constants
-DEFAULT_MANIFEST = "preprocessed_data/dataset_manifest.csv"
+DEFAULT_MANIFEST = "preprocessed_data2/dataset_manifest.csv"
 DEFAULT_EPOCHS = 40
 DEFAULT_BATCH_SIZE = 64
 DEFAULT_LR = 1e-3
 DEFAULT_MIN_LR = 1e-5
-DEFAULT_VAL_MIN_SIZE = 30
+DEFAULT_VAL_MIN_SIZE = 10
 DEFAULT_WEIGHT_DECAY = 1e-4
 DEFAULT_NUM_WORKERS = 8
-DEFAULT_SAVE_PATH = "models/attention_unet/attention_unet.pth"
-DEFAULT_CHECKPOINT_PATH = "latest_checkpoint.pth"
+DEFAULT_SAVE_PATH = "models/unet/unet.pth"
+DEFAULT_CHECKPOINT_PATH = "latest_checkpoint2.pth"
 
 def remove_small_objects(binary_mask, min_size=30):
     """
@@ -88,11 +88,12 @@ def worker_init_fn(worker_id):
 
 class LIDC2DDataset(Dataset):
     """
-    Standard PyTorch 2D Dataset for LIDC-IDRI slices.
+    Standard PyTorch 2D Dataset for preprocessed LIDC-IDRI slices.
     Loads slice npz files directly from disk on-the-fly with context management for file safety.
     """
     def __init__(self, manifest_csv, split="train", transform=None):
         df = pd.read_csv(manifest_csv)
+        df["filepath"] = df["filepath"].str.replace("\\", "/", regex=False)
         self.data_entries = df[df["split"] == split].reset_index(drop=True)
         self.transform = transform
 
@@ -115,13 +116,21 @@ class LIDC2DDataset(Dataset):
         if self.transform:
             sample = self.transform(sample)
 
-        return sample["image"], sample["mask"]
+        pid = str(row["patient_id"])
+        slice_idx = int(row["slice_idx"])
+        return sample["image"], sample["mask"], pid, slice_idx
+
 
 def get_transforms():
     """
-    Returns MONAI transform pipelines with data augmentations.
+    Returns MONAI transform pipelines with spatial resizing (256x256) and data augmentations.
     """
     train_transforms = Compose([
+        Resized(
+            keys=["image", "mask"],
+            spatial_size=(256, 256),
+            mode=["bilinear", "nearest"]
+        ),
         RandRotated(
             keys=["image", "mask"],
             range_x=0.26,                  # ±15 degrees random rotation
@@ -152,10 +161,16 @@ def get_transforms():
     ])
 
     val_transforms = Compose([
+        Resized(
+            keys=["image", "mask"],
+            spatial_size=(256, 256),
+            mode=["bilinear", "nearest"]
+        ),
         EnsureTyped(keys=["image", "mask"])
     ])
 
     return train_transforms, val_transforms
+
 
 def plot_training_history(history, save_path="training_history.png"):
     """
@@ -164,14 +179,16 @@ def plot_training_history(history, save_path="training_history.png"):
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5))
 
     ax1.plot(history['epoch'], history['train_loss'], label='Train Loss', color='blue', linewidth=2)
-    ax1.set_title('Training Loss (DiceCELoss)', fontsize=12, fontweight='bold')
+    ax1.set_title('Training Loss (DiceFocalLoss)', fontsize=12, fontweight='bold')
     ax1.set_xlabel('Epoch')
     ax1.set_ylabel('Loss')
     ax1.grid(True, linestyle='--', alpha=0.6)
     ax1.legend()
 
-    ax2.plot(history['epoch'], history['val_dice'], label='Val Dice Score', color='green', linewidth=2)
-    ax2.set_title('Validation Dice Coefficient', fontsize=12, fontweight='bold')
+    ax2.plot(history['epoch'], history['val_3d_dice'], label='Val 3D Volumetric Dice', color='green', linewidth=2)
+    if 'val_pos_dice' in history and history['val_pos_dice']:
+        ax2.plot(history['epoch'], history['val_pos_dice'], label='Val 2D Tumor Slice Dice', color='orange', linestyle='--', linewidth=1.5)
+    ax2.set_title('Validation Volumetric & Slice Dice', fontsize=12, fontweight='bold')
     ax2.set_xlabel('Epoch')
     ax2.set_ylabel('Dice Metric')
     ax2.grid(True, linestyle='--', alpha=0.6)
@@ -180,7 +197,7 @@ def plot_training_history(history, save_path="training_history.png"):
     plt.tight_layout()
     plt.savefig(save_path, dpi=150)
     plt.close()
-    print(f"Saved training curves plot to: {save_path}")
+
 
 def train_epoch(model, loader, optimizer, loss_fn, device, epoch, total_epochs, scaler=None):
     """
@@ -191,14 +208,15 @@ def train_epoch(model, loader, optimizer, loss_fn, device, epoch, total_epochs, 
     start_time = time.time()
 
     pbar = tqdm(loader, desc=f"Epoch {epoch:02d}/{total_epochs:02d} [Train]", leave=False, dynamic_ncols=True)
-    for batch_idx, (images, masks) in enumerate(pbar, 1):
+    for batch_idx, batch in enumerate(pbar, 1):
+        images, masks = batch[0], batch[1]
         images = images.to(device, non_blocking=True)
         masks = masks.to(device, non_blocking=True)
 
         optimizer.zero_grad()
 
         if scaler is not None and device.type == "cuda":
-            with torch.cuda.amp.autocast():
+            with torch.amp.autocast('cuda'):
                 logits = model(images)
                 loss = loss_fn(logits, masks)
             scaler.scale(loss).backward()
@@ -218,45 +236,83 @@ def train_epoch(model, loader, optimizer, loss_fn, device, epoch, total_epochs, 
     epoch_loss = running_loss / len(loader.dataset)
     elapsed = time.time() - start_time
     return epoch_loss, elapsed
-def validate_epoch(model, loader, dice_metric, device, use_amp=True, val_min_size=30):
+
+
+def validate_epoch(model, loader, device, use_amp=True, val_min_size=30):
     """
-    Evaluates MONAI UNet on validation set with optional AMP FP16 precision.
-    Applies small connected component post-processing filter (val_min_size px) to eliminate false positives.
+    Evaluates MONAI UNet on full patient validation scans.
+    Reconstructs 3D patient volumes to compute 3D Patient Volumetric Dice & 2D Tumor Slice Dice.
     """
     model.eval()
-    dice_metric.reset()
+
+    patient_3d_preds = {}
+    patient_3d_gts = {}
+    pos_slice_dices = []
 
     pbar = tqdm(loader, desc="[Val]", leave=False, dynamic_ncols=True)
     with torch.no_grad():
-        for images, masks in pbar:
+        for batch in pbar:
+            images, masks, pids, s_idxs = batch[0], batch[1], batch[2], batch[3]
             images = images.to(device, non_blocking=True)
             masks = masks.to(device, non_blocking=True)
 
             if use_amp and device.type == "cuda":
-                with torch.cuda.amp.autocast():
+                with torch.amp.autocast('cuda'):
                     logits = model(images)
             else:
                 logits = model(images)
 
             preds_raw = (torch.sigmoid(logits) > 0.5).float()
 
-            if val_min_size > 0:
-                preds_np = preds_raw.cpu().numpy()
-                for b in range(preds_np.shape[0]):
-                    preds_np[b, 0] = remove_small_objects(preds_np[b, 0], min_size=val_min_size)
-                preds = torch.from_numpy(preds_np).to(device)
-            else:
-                preds = preds_raw
+            preds_np = preds_raw.cpu().numpy()
+            masks_np = masks.cpu().numpy()
 
-            dice_metric(y_pred=preds, y=masks)
+            for b in range(preds_np.shape[0]):
+                p_mask = preds_np[b, 0]
+                g_mask = masks_np[b, 0]
+                pid = pids[b]
+                s_idx = int(s_idxs[b])
 
-    mean_dice = dice_metric.aggregate().item()
-    dice_metric.reset()
-    return mean_dice
+                if val_min_size > 0:
+                    p_mask = remove_small_objects(p_mask, min_size=val_min_size)
+
+                # Store for 3D patient reconstruction
+                if pid not in patient_3d_preds:
+                    patient_3d_preds[pid] = {}
+                    patient_3d_gts[pid] = {}
+                patient_3d_preds[pid][s_idx] = p_mask
+                patient_3d_gts[pid][s_idx] = g_mask
+
+                # 2D Slice Dice (positive tumor slices)
+                p_sum = np.sum(p_mask)
+                g_sum = np.sum(g_mask)
+                if g_sum > 0:
+                    intersection = np.sum(p_mask * g_mask)
+                    dice_2d = (2.0 * intersection) / (p_sum + g_sum + 1e-8)
+                    pos_slice_dices.append(dice_2d)
+
+    # Compute 3D Volumetric Dice on tumor-bearing patient scans
+    patient_3d_dices = []
+    for pid in patient_3d_preds:
+        s_keys = sorted(patient_3d_preds[pid].keys())
+        vol_pred = np.stack([patient_3d_preds[pid][k] for k in s_keys], axis=-1)
+        vol_gt = np.stack([patient_3d_gts[pid][k] for k in s_keys], axis=-1)
+
+        v_gt_sum = np.sum(vol_gt)
+        if v_gt_sum > 0:  # Only compute 3D volumetric dice on patients with actual nodules
+            inter = np.sum(vol_pred * vol_gt)
+            v_pred_sum = np.sum(vol_pred)
+            p_dice = (2.0 * inter) / (v_pred_sum + v_gt_sum + 1e-8)
+            patient_3d_dices.append(p_dice)
+
+    mean_3d_vol_dice = float(np.mean(patient_3d_dices)) if patient_3d_dices else 0.0
+    mean_pos_slice_dice = float(np.mean(pos_slice_dices)) if pos_slice_dices else 0.0
+
+    return mean_3d_vol_dice, mean_pos_slice_dice
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Train 2D MONAI UNet Model on LIDC-IDRI Dataset (Accelerated AMP FP16 & Cross-Platform)")
+    parser = argparse.ArgumentParser(description="Train MONAI 2D UNet Model on LIDC-IDRI Dataset (3D Volumetric Validation & AMP FP16)")
     parser.add_argument("--manifest", type=str, default=DEFAULT_MANIFEST, help=f"Path to master manifest CSV (default: {DEFAULT_MANIFEST})")
     parser.add_argument("--epochs", type=int, default=DEFAULT_EPOCHS, help=f"Total target training epochs (default: {DEFAULT_EPOCHS})")
     parser.add_argument("--batch_size", type=int, default=DEFAULT_BATCH_SIZE, help=f"Batch size for training (default: {DEFAULT_BATCH_SIZE})")
@@ -271,8 +327,6 @@ def main():
 
     args = parser.parse_args()
 
-
-
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"=======================================================")
     print(f"Using Compute Device: {device}")
@@ -280,7 +334,7 @@ def main():
         print(f"GPU Name: {torch.cuda.get_device_name(0)}")
         print(f"GPU VRAM: {torch.cuda.get_device_properties(0).total_memory / 1e9:.2f} GB")
         torch.backends.cudnn.benchmark = True
-    print(f"DataLoader Multi-Worker Settings: num_workers={args.num_workers}, persistent_workers={args.num_workers > 0}, pin_memory={device.type == 'cuda'}")
+    print(f"DataLoader Settings: num_workers={args.num_workers}, pin_memory={device.type == 'cuda'}")
     print(f"=======================================================\n")
 
     # Load Transforms & Datasets
@@ -311,7 +365,7 @@ def main():
         worker_init_fn=worker_init_fn if args.num_workers > 0 else None
     )
 
-    # Instantiate Wider MONAI 2D UNet Architecture
+    # Instantiate MONAI 2D UNet Architecture
     unet_channels = (16, 32, 64, 128, 256)
     model_kwargs = {
         "spatial_dims": 2,
@@ -319,19 +373,21 @@ def main():
         "out_channels": 1,
         "channels": unet_channels,
         "strides": (2, 2, 2, 2),
-        #"num_res_units": 2
+        "num_res_units": 2
     }
-    model = AttentionUnet(**model_kwargs).to(device)
+    
+    model = UNet(**model_kwargs).to(device)
+    arch_name = "MONAI 2D UNet"
+
     num_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
 
     loss_fn = DiceFocalLoss(sigmoid=True, squared_pred=True, gamma=2.0)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay, fused=True)
-    dice_metric = DiceMetric(include_background=True, reduction="mean")
-    scaler = torch.cuda.amp.GradScaler() if device.type == "cuda" else None
+    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay, fused=True if device.type == 'cuda' else False)
+    scaler = torch.amp.GradScaler('cuda') if device.type == "cuda" else None
 
     start_epoch = 1
     best_val_dice = 0.0
-    history = {"epoch": [], "train_loss": [], "val_dice": []}
+    history = {"epoch": [], "train_loss": [], "val_3d_dice": [], "val_pos_dice": []}
 
     # Resume capability from checkpoint
     if args.resume:
@@ -352,53 +408,53 @@ def main():
                 print(f"--> Note: Checkpoint is at epoch {checkpoint['epoch']}, but target --epochs is set to {args.epochs}.")
                 print(f"    Please pass a higher --epochs argument (e.g., --epochs {checkpoint['epoch'] + 30}) to train further.")
 
-            # Set learning rate to args.lr for continued training
             old_lr = optimizer.param_groups[0]["lr"]
             for param_group in optimizer.param_groups:
                 param_group["lr"] = args.lr
             print(f"--> Active Learning Rate set to: {args.lr:.2e} (was {old_lr:.2e}).")
 
-            # Create smooth scheduler for remaining epochs
             remaining_epochs = max(1, args.epochs - start_epoch + 1)
             scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=remaining_epochs, eta_min=args.min_lr)
-            print(f"--> Resuming from Epoch {start_epoch}. Continuing to target Epoch {args.epochs} ({remaining_epochs} epochs remaining). Previous Best Val Dice: {best_val_dice:.4f}\n")
+            print(f"--> Resuming from Epoch {start_epoch}. Continuing to target Epoch {args.epochs}. Previous Best Val 3D Dice: {best_val_dice:.4f}\n")
         else:
             print(f"--> Note: --resume flag was set, but checkpoint file '{args.checkpoint_path}' does not exist yet. Starting training from scratch.\n")
             scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs, eta_min=args.min_lr)
     else:
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs, eta_min=args.min_lr)
 
-
-    print(f"\nStarting Training: Wider MONAI 2D UNet (AMP FP16) | Channels: {unet_channels} ({num_params/1e6:.2f}M Params) | Target Epochs: {args.epochs} | Batch Size: {args.batch_size} | Workers: {args.num_workers} | Active LR: {optimizer.param_groups[0]['lr']:.2e}\n", flush=True)
+    print(f"\nStarting Training: {arch_name} (AMP FP16) | Channels: {unet_channels} ({num_params/1e6:.2f}M Params) | Target Epochs: {args.epochs} | Batch Size: {args.batch_size} | Workers: {args.num_workers}\n", flush=True)
 
     total_start = time.time()
     for epoch in range(start_epoch, args.epochs + 1):
         train_loss, train_time = train_epoch(model, train_loader, optimizer, loss_fn, device, epoch, args.epochs, scaler=scaler)
-        val_dice = validate_epoch(model, val_loader, dice_metric, device, use_amp=True, val_min_size=args.val_min_size)
+        val_3d_dice, val_pos_dice = validate_epoch(model, val_loader, device, use_amp=True, val_min_size=args.val_min_size)
         current_lr = optimizer.param_groups[0]["lr"]
 
         scheduler.step()
 
         history["epoch"].append(epoch)
         history["train_loss"].append(train_loss)
-        history["val_dice"].append(val_dice)
+        history["val_3d_dice"].append(val_3d_dice)
+        history["val_pos_dice"].append(val_pos_dice)
 
-        is_best = val_dice > best_val_dice
+        is_best = val_pos_dice > best_val_dice
         if is_best:
-            best_val_dice = val_dice
+            best_val_dice = val_pos_dice
             abs_save_path = os.path.abspath(args.save_path)
+            os.makedirs(os.path.dirname(abs_save_path), exist_ok=True)
             torch.save({
                 "epoch": epoch,
                 "model_state_dict": model.state_dict(),
                 "optimizer_state_dict": optimizer.state_dict(),
-                "val_dice": val_dice,
+                "val_dice": val_pos_dice,
+                "val_3d_dice": val_3d_dice,
                 "model_kwargs": model_kwargs
             }, abs_save_path)
             best_str = f" -> [BEST MODEL SAVED to {abs_save_path}]"
         else:
             best_str = ""
 
-        # Save checkpoint after EVERY epoch to allow resuming if PC crashes
+        # Save checkpoint after EVERY epoch
         checkpoint_data = {
             "epoch": epoch,
             "model_state_dict": model.state_dict(),
@@ -410,17 +466,16 @@ def main():
             "model_kwargs": model_kwargs
         }
         torch.save(checkpoint_data, args.checkpoint_path)
-        # Update training history plot after every epoch
         plot_training_history(history, save_path="training_history.png")
 
-        print(f"Epoch {epoch:02d}/{args.epochs:02d} | Train Loss: {train_loss:.4f} | Val Dice: {val_dice:.4f} | LR: {current_lr:.2e} | Time: {train_time:.1f}s{best_str}")
+        print(f"Epoch {epoch:02d}/{args.epochs:02d} | Train Loss: {train_loss:.4f} | Val 3D Vol Dice: {val_3d_dice:.4f} (2D Tumor Dice: {val_pos_dice:.4f}) | LR: {current_lr:.2e} | Time: {train_time:.1f}s{best_str}")
 
     total_elapsed = time.time() - total_start
 
     print(f"\n=======================================================")
     print(f"Training Complete in {total_elapsed / 60:.2f} minutes!")
-    print(f"Best Validation Dice Score: {best_val_dice:.4f}")
-    print(f"Saved Checkpoint to: {args.save_path}")
+    print(f"Best Validation 3D Volumetric Dice Score: {best_val_dice:.4f}")
+    print(f"Saved Best Model to: {args.save_path}")
     print(f"=======================================================")
 
     plot_training_history(history, save_path="training_history.png")

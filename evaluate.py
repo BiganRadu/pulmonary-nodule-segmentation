@@ -22,22 +22,23 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 from scipy.ndimage import label
+from tqdm import tqdm
 
 # PyTorch & MONAI
 import torch
+import torch.nn.functional as F
 from torch.utils.data import DataLoader
-from monai.metrics import DiceMetric
-from monai.networks.nets import AttentionUnet, UNet
+from monai.networks.nets import UNet
 
 # Local imports
 from train import LIDC2DDataset, get_transforms
 
 # Default Configuration Constants
-DEFAULT_MANIFEST = "preprocessed_data/dataset_manifest.csv"
-DEFAULT_MODEL_PATH = "models/attention_unet/attention_unet.pth"
+DEFAULT_MANIFEST = "preprocessed_data2/dataset_manifest.csv"
+DEFAULT_MODEL_PATH = "latest_checkpoint.pth"
 DEFAULT_BATCH_SIZE = 32
 DEFAULT_NUM_WORKERS = 8
-DEFAULT_MIN_SIZE = 30
+DEFAULT_MIN_SIZE = 10
 DEFAULT_OUTPUT_PREVIEW = "test_predictions_preview.png"
 
 
@@ -59,13 +60,16 @@ def remove_small_objects(binary_mask, min_size=DEFAULT_MIN_SIZE):
     return cleaned_mask
 
 
-def evaluate_test_set(model, loader, dice_metric, device, min_size=30):
+def evaluate_test_set(model, loader, device, min_size=30):
     """
     Evaluates trained MONAI UNet model on unseen Test split in standard FP32 precision.
-    Applies small connected component post-processing filter (min_size px).
+    Computes 2D Tumor Slice Dice, 3D Patient Volumetric Dice, Precision, Recall, and IoU.
     """
     model.eval()
-    dice_metric.reset()
+
+    patient_3d_preds = {}
+    patient_3d_gts = {}
+    pos_slice_dices = []
 
     total_intersection = 0.0
     total_pred_mask = 0.0
@@ -74,39 +78,70 @@ def evaluate_test_set(model, loader, dice_metric, device, min_size=30):
     print(f"Evaluating MONAI 2D UNet model on Test Set (Component filter ≥{min_size}px)...")
 
     with torch.no_grad():
-        for images, masks in loader:
+        for batch in tqdm(loader, desc="[Evaluating Test Set]"):
+            images, masks, pids, s_idxs = batch[0], batch[1], batch[2], batch[3]
             images = images.to(device, non_blocking=True)
             masks = masks.to(device, non_blocking=True)
 
             logits = model(images)
             preds_raw = (torch.sigmoid(logits) > 0.5).float()
 
-            if min_size > 0:
-                preds_np = preds_raw.cpu().numpy()
-                for b in range(preds_np.shape[0]):
-                    preds_np[b, 0] = remove_small_objects(preds_np[b, 0], min_size=min_size)
-                preds = torch.from_numpy(preds_np).to(device)
-            else:
-                preds = preds_raw
+            preds_np = preds_raw.cpu().numpy()
+            masks_np = masks.cpu().numpy()
 
-            dice_metric(y_pred=preds, y=masks)
+            for b in range(preds_np.shape[0]):
+                p_mask = preds_np[b, 0]
+                g_mask = masks_np[b, 0]
+                pid = pids[b]
+                s_idx = int(s_idxs[b])
 
-            inter = torch.sum(preds * masks).item()
-            p_sum = torch.sum(preds).item()
-            g_sum = torch.sum(masks).item()
+                if min_size > 0:
+                    p_mask = remove_small_objects(p_mask, min_size=min_size)
 
-            total_intersection += inter
-            total_pred_mask += p_sum
-            total_gt_mask += g_sum
+                # Store slice for 3D patient volume reconstruction
+                if pid not in patient_3d_preds:
+                    patient_3d_preds[pid] = {}
+                    patient_3d_gts[pid] = {}
+                patient_3d_preds[pid][s_idx] = p_mask
+                patient_3d_gts[pid][s_idx] = g_mask
 
-    mean_dice = dice_metric.aggregate().item()
-    dice_metric.reset()
+                # Global voxel counters
+                inter = np.sum(p_mask * g_mask)
+                p_sum = np.sum(p_mask)
+                g_sum = np.sum(g_mask)
+
+                total_intersection += inter
+                total_pred_mask += p_sum
+                total_gt_mask += g_sum
+
+                # 2D Slice Dice on positive tumor slices
+                if g_sum > 0:
+                    dice_2d = (2.0 * inter) / (p_sum + g_sum + 1e-8)
+                    pos_slice_dices.append(dice_2d)
+
+    # Compute 3D Volumetric Dice on tumor-bearing patient scans
+    patient_3d_dices = []
+    for pid in patient_3d_preds:
+        s_keys = sorted(patient_3d_preds[pid].keys())
+        vol_pred = np.stack([patient_3d_preds[pid][k] for k in s_keys], axis=-1)
+        vol_gt = np.stack([patient_3d_gts[pid][k] for k in s_keys], axis=-1)
+
+        v_gt_sum = np.sum(vol_gt)
+        if v_gt_sum > 0:
+            inter = np.sum(vol_pred * vol_gt)
+            v_pred_sum = np.sum(vol_pred)
+            p_dice = (2.0 * inter) / (v_pred_sum + v_gt_sum + 1e-8)
+            patient_3d_dices.append(p_dice)
+
+    mean_2d_dice = float(np.mean(pos_slice_dices)) if pos_slice_dices else 0.0
+    mean_3d_dice = float(np.mean(patient_3d_dices)) if patient_3d_dices else 0.0
 
     precision = total_intersection / (total_pred_mask + 1e-8)
     recall = total_intersection / (total_gt_mask + 1e-8)
     iou = total_intersection / (total_pred_mask + total_gt_mask - total_intersection + 1e-8)
 
-    return mean_dice, precision, recall, iou
+    return mean_2d_dice, mean_3d_dice, precision, recall, iou
+
 
 def save_visual_predictions(model, test_dataset, device, output_path="test_predictions_preview.png", num_samples=6, min_size=30):
     """
@@ -122,11 +157,11 @@ def save_visual_predictions(model, test_dataset, device, output_path="test_predi
 
     sample_indices = pos_indices[:num_samples]
     fig, axes = plt.subplots(num_samples, 3, figsize=(12, 3.8 * num_samples))
-    fig.suptitle("MONAI 2D UNet Tumor Predictions", fontsize=14, fontweight='bold')
+    fig.suptitle("MONAI 2D UNet Tumor Predictions (Test Set)", fontsize=14, fontweight='bold')
 
     with torch.no_grad():
         for row_idx, data_idx in enumerate(sample_indices):
-            image_tensor, mask_tensor = test_dataset[data_idx]
+            image_tensor, mask_tensor, pid, slice_idx = test_dataset[data_idx]
             img_input = image_tensor.unsqueeze(0).to(device)
 
             logits = model(img_input)
@@ -141,12 +176,9 @@ def save_visual_predictions(model, test_dataset, device, output_path="test_predi
             ax_gt = axes[row_idx, 1] if num_samples > 1 else axes[1]
             ax_pred = axes[row_idx, 2] if num_samples > 1 else axes[2]
 
-            patient_id = test_dataset.data_entries.iloc[data_idx]["patient_id"]
-            slice_idx = test_dataset.data_entries.iloc[data_idx]["slice_idx"]
-
             # Column 1: CT Image
             ax_img.imshow(img_np, cmap='gray', vmin=0.0, vmax=1.0)
-            ax_img.set_title(f"{patient_id} - Slice {slice_idx}\nInput CT Image", fontsize=10)
+            ax_img.set_title(f"{pid} - Slice {slice_idx}\nInput CT Image", fontsize=10)
             ax_img.axis('off')
 
             # Column 2: Ground Truth Overlay
@@ -168,6 +200,7 @@ def save_visual_predictions(model, test_dataset, device, output_path="test_predi
     plt.close()
     print(f"Saved visual predictions preview to: {output_path}")
 
+
 def main():
     parser = argparse.ArgumentParser(description="Evaluate Trained MONAI 2D UNet Model on Test Set")
     parser.add_argument("--manifest", type=str, default=DEFAULT_MANIFEST, help=f"Path to manifest CSV (default: {DEFAULT_MANIFEST})")
@@ -180,7 +213,7 @@ def main():
     args = parser.parse_args()
 
     if not os.path.exists(args.model_path):
-        print(f"Error: Model checkpoint file '{args.model_path}' not found. Please train a model first using train_monai_2d.py.")
+        print(f"Error: Model checkpoint file '{args.model_path}' not found. Please train a model first using train.py.")
         return
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -188,7 +221,8 @@ def main():
 
     # Load Checkpoint & Instantiate MONAI 2D UNet
     checkpoint = torch.load(args.model_path, map_location=device)
-    print(f"Loading trained MONAI 2D UNet model from {args.model_path} (Best Val Dice: {checkpoint.get('val_dice', 0.0):.4f})...")
+    val_dice_str = f" (Best Val Dice: {checkpoint.get('val_dice', 0.0):.4f})" if 'val_dice' in checkpoint else ""
+    print(f"Loading trained MONAI 2D UNet model from {args.model_path}{val_dice_str}...")
 
     state_dict = checkpoint["model_state_dict"]
     if "model_kwargs" in checkpoint:
@@ -201,16 +235,12 @@ def main():
             "in_channels": 1,
             "out_channels": 1,
             "channels": tuple(base * (2**i) for i in range(5)),
-            "strides": (2, 2, 2, 2)
+            "strides": (2, 2, 2, 2),
+            "num_res_units": 2
         }
 
-    try:
-        model = AttentionUnet(**model_kwargs).to(device)
-        model.load_state_dict(state_dict)
-    except Exception:
-        model = UNet(**model_kwargs).to(device)
-        model.load_state_dict(state_dict)
-
+    model = UNet(**model_kwargs).to(device)
+    model.load_state_dict(state_dict)
 
     _, val_transforms = get_transforms()
     test_dataset = LIDC2DDataset(args.manifest, split="test", transform=val_transforms)
@@ -224,12 +254,12 @@ def main():
         prefetch_factor=2 if args.num_workers > 0 else None
     )
 
-    dice_metric = DiceMetric(include_background=False, reduction="mean")
-    test_dice, precision, recall, iou = evaluate_test_set(model, test_loader, dice_metric, device, min_size=args.min_size)
+    mean_2d_dice, mean_3d_dice, precision, recall, iou = evaluate_test_set(model, test_loader, device, min_size=args.min_size)
 
     print(f"\n=======================================================")
     print(f"TEST SET EVALUATION RESULTS (Component Filter ≥{args.min_size}px):")
-    print(f"  - Test Dice Score:          {test_dice:.4f}")
+    print(f"  - 2D Tumor Slice Dice:      {mean_2d_dice:.4f}")
+    print(f"  - 3D Patient Volumetric Dice:{mean_3d_dice:.4f}")
     print(f"  - Intersection/Union (IoU): {iou:.4f}")
     print(f"  - Precision:                {precision:.4f}")
     print(f"  - Recall:                   {recall:.4f}")
@@ -241,7 +271,3 @@ if __name__ == "__main__":
     if sys.platform == "win32":
         multiprocessing.freeze_support()
     main()
-
-
-
-
