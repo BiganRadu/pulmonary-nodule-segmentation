@@ -1,5 +1,5 @@
 =========================================================================================================
-                   HIERARCHICAL EVALUATION REPORT - MONAI 2D UNET (Filter ≥10px)
+                   HIERARCHICAL EVALUATION REPORT - MONAI 2D ATTENTION_UNET (Filter ≥10px)
 =========================================================================================================
 
 1. PER-SLICE EVALUATION:
