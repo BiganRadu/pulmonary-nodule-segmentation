@@ -2,6 +2,7 @@
 # Datasets & Large Data Directories
 # ==========================================
 preprocessed_data/
+scripts/
 *.zip
 
 # Medical Imaging Data & Slice Files
