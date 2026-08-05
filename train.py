@@ -21,20 +21,14 @@ if sys.platform == "win32":
             except Exception:
                 pass
 
-# 3rd party
-import numpy as np
-import pandas as pd
-import matplotlib.pyplot as plt
-from tqdm import tqdm
-from scipy.ndimage import label
-
-# PyTorch & MONAI
+# PyTorch & MONAI (Must be imported before pandas/scipy on Windows to prevent WinError 1114 DLL conflicts)
 import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
 
 import monai
 from monai.networks.nets import UNet
+from monai.networks.nets import AttentionUnet
 from monai.losses import DiceFocalLoss
 from monai.transforms import (
     Compose,
@@ -46,19 +40,28 @@ from monai.transforms import (
     EnsureTyped
 )
 
+# 3rd party
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from tqdm import tqdm
+from scipy.ndimage import label, binary_erosion
+
 # Default Configuration Constants
 DEFAULT_MANIFEST = "preprocessed_data2/dataset_manifest.csv"
 DEFAULT_EPOCHS = 40
 DEFAULT_BATCH_SIZE = 64
 DEFAULT_LR = 1e-3
 DEFAULT_MIN_LR = 1e-5
-DEFAULT_VAL_MIN_SIZE = 10
+DEFAULT_VAL_MIN_SIZE = 0
 DEFAULT_WEIGHT_DECAY = 1e-4
 DEFAULT_NUM_WORKERS = 8
-DEFAULT_SAVE_PATH = "models/unet/unet.pth"
-DEFAULT_CHECKPOINT_PATH = "latest_checkpoint2.pth"
+DEFAULT_SAVE_PATH = "models/attention_unet/attention_unet.pth"
+DEFAULT_CHECKPOINT_PATH = "models/attention_unet/latest_checkpoint.pth"
+DEFAULT_RESULTS_LOG = "models/attention_unet/results.txt"
 
-def remove_small_objects(binary_mask, min_size=30):
+
+def remove_small_objects(binary_mask, min_size):
     """
     Removes connected components in binary_mask that have fewer than min_size pixels.
     Eliminates small false positive noise predictions.
@@ -75,11 +78,39 @@ def remove_small_objects(binary_mask, min_size=30):
     cleaned_mask[too_small[labeled_mask]] = 0
     return cleaned_mask
 
+
+def compute_surface_distances(pred_binary, gt_binary):
+    """
+    Computes 95th Percentile Hausdorff Distance (HD95) and Average Surface Distance (ASD)
+    between 2D/3D binary prediction and ground truth masks.
+    Returns (np.nan, np.nan) if either mask is empty.
+    """
+    if np.sum(pred_binary) == 0 or np.sum(gt_binary) == 0:
+        return np.nan, np.nan
+
+    pred_border = pred_binary ^ binary_erosion(pred_binary)
+    gt_border = gt_binary ^ binary_erosion(gt_binary)
+
+    pred_pts = np.argwhere(pred_border)
+    gt_pts = np.argwhere(gt_border)
+
+    if len(pred_pts) == 0 or len(gt_pts) == 0:
+        return np.nan, np.nan
+
+    # Calculate surface point distances efficiently
+    d_p2g = np.min(np.linalg.norm(pred_pts[:, None, :] - gt_pts[None, :, :], axis=2), axis=1)
+    d_g2p = np.min(np.linalg.norm(gt_pts[:, None, :] - pred_pts[None, :, :], axis=2), axis=1)
+
+    all_dists = np.concatenate([d_p2g, d_g2p])
+    hd95 = float(np.percentile(all_dists, 95))
+    asd = float(np.mean(all_dists))
+    return hd95, asd
+
+
 def worker_init_fn(worker_id):
     """
     Worker initialization function for PyTorch DataLoaders (Cross-platform: Linux & Windows).
-    Ensures each worker process gets a unique random seed for Python, NumPy, and PyTorch,
-    preventing duplicate random data augmentations across multi-process DataLoader workers.
+    Ensures each worker process gets a unique random seed for Python, NumPy, and PyTorch.
     """
     worker_seed = (torch.initial_seed() + worker_id) % (2**32)
     np.random.seed(worker_seed)
@@ -89,17 +120,13 @@ def worker_init_fn(worker_id):
 class LIDC2DDataset(Dataset):
     """
     Standard PyTorch 2D Dataset for preprocessed LIDC-IDRI slices.
-    Loads slice npz files directly from disk on-the-fly with context management for file safety.
+    Loads slice npz files directly from disk on-the-fly.
     """
     def __init__(self, manifest_csv, split="train", transform=None):
         df = pd.read_csv(manifest_csv)
         df["filepath"] = df["filepath"].str.replace("\\", "/", regex=False)
         self.data_entries = df[df["split"] == split].reset_index(drop=True)
         self.transform = transform
-
-        pos_count = int((self.data_entries['has_tumor'] == 1).sum())
-        neg_count = int((self.data_entries['has_tumor'] == 0).sum())
-        print(f"[{split.upper()} Set] Loaded {len(self.data_entries)} 2D slice pairs ({pos_count} Positive, {neg_count} Negative).")
 
     def __len__(self):
         return len(self.data_entries)
@@ -174,25 +201,68 @@ def get_transforms():
 
 def plot_training_history(history, save_path="training_history.png"):
     """
-    Plots and saves loss and validation Dice score curves over training epochs.
+    Plots training loss and validation metrics across 4 separate organized subplots:
+    1. Training Loss
+    2. Overlap & Composite Score (2D Dice, 3D Dice, IoU, Composite Score)
+    3. Detection & Classification Rates (Precision, Sensitivity, Specificity)
+    4. Boundary Errors (HD95 & ASD in mm)
     """
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5))
+    epochs = history.get('epoch', [])
+    if not epochs:
+        return
 
-    ax1.plot(history['epoch'], history['train_loss'], label='Train Loss', color='blue', linewidth=2)
-    ax1.set_title('Training Loss (DiceFocalLoss)', fontsize=12, fontweight='bold')
+    fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+
+    # 1. Training Loss
+    ax1 = axes[0, 0]
+    ax1.plot(epochs, history['train_loss'], label='Train Loss', color='royalblue', linewidth=2)
+    ax1.set_title('Training Loss (DiceFocalLoss)', fontsize=11, fontweight='bold')
     ax1.set_xlabel('Epoch')
     ax1.set_ylabel('Loss')
-    ax1.grid(True, linestyle='--', alpha=0.6)
+    ax1.grid(True, linestyle='--', alpha=0.5)
     ax1.legend()
 
-    ax2.plot(history['epoch'], history['val_3d_dice'], label='Val 3D Volumetric Dice', color='green', linewidth=2)
-    if 'val_pos_dice' in history and history['val_pos_dice']:
-        ax2.plot(history['epoch'], history['val_pos_dice'], label='Val 2D Tumor Slice Dice', color='orange', linestyle='--', linewidth=1.5)
-    ax2.set_title('Validation Volumetric & Slice Dice', fontsize=12, fontweight='bold')
+    # 2. Overlap & Composite Score
+    ax2 = axes[0, 1]
+    if 'val_pos_dice' in history:
+        ax2.plot(epochs, history['val_pos_dice'], label='2D Tumor Dice', color='darkorange', linewidth=2)
+    if 'val_iou' in history:
+        ax2.plot(epochs, history['val_iou'], label='2D IoU', color='purple', linestyle='--', linewidth=1.5)
+    if 'val_3d_dice' in history:
+        ax2.plot(epochs, history['val_3d_dice'], label='3D Volumetric Dice', color='forestgreen', linewidth=2)
+    if 'composite_score' in history:
+        ax2.plot(epochs, history['composite_score'], label='Composite Score', color='crimson', linestyle=':', linewidth=2)
+    ax2.set_title('Segmentation Overlap & Composite Score', fontsize=11, fontweight='bold')
     ax2.set_xlabel('Epoch')
-    ax2.set_ylabel('Dice Metric')
-    ax2.grid(True, linestyle='--', alpha=0.6)
+    ax2.set_ylabel('Score [0-1]')
+    ax2.grid(True, linestyle='--', alpha=0.5)
     ax2.legend()
+
+    # 3. Detection & Classification Rates
+    ax3 = axes[1, 0]
+    if 'val_prec' in history:
+        ax3.plot(epochs, history['val_prec'], label='Precision', color='teal', linewidth=2)
+    if 'val_sens' in history:
+        ax3.plot(epochs, history['val_sens'], label='Sensitivity (Recall)', color='firebrick', linewidth=2)
+    if 'val_spec' in history:
+        ax3.plot(epochs, history['val_spec'], label='Specificity', color='darkgreen', linestyle='--', linewidth=1.5)
+    ax3.set_title('Detection Rates (Precision, Sensitivity, Specificity)', fontsize=11, fontweight='bold')
+    ax3.set_xlabel('Epoch')
+    ax3.set_ylabel('Rate [0-1]')
+    ax3.grid(True, linestyle='--', alpha=0.5)
+    ax3.legend()
+
+    # 4. Boundary Error Distances
+    ax4 = axes[1, 1]
+    if 'val_hd95' in history:
+        ax4.plot(epochs, history['val_hd95'], label='HD95 (mm)', color='darkred', linewidth=2)
+    if 'val_asd' in history:
+        ax4.plot(epochs, history['val_asd'], label='ASD (mm)', color='navy', linestyle='--', linewidth=1.5)
+    ax4.set_title('Boundary Distance Errors (HD95 & ASD)', fontsize=11, fontweight='bold')
+    ax4.set_xlabel('Epoch')
+    ax4.set_ylabel('Distance Error (mm)')
+    ax4.grid(True, linestyle='--', alpha=0.5)
+    ax4.legend()
 
     plt.tight_layout()
     plt.savefig(save_path, dpi=150)
@@ -201,7 +271,7 @@ def plot_training_history(history, save_path="training_history.png"):
 
 def train_epoch(model, loader, optimizer, loss_fn, device, epoch, total_epochs, scaler=None):
     """
-    Trains MONAI UNet for 1 epoch using PyTorch AMP FP16 / FP32 precision with progress tracking.
+    Trains MONAI UNet for 1 epoch using PyTorch AMP FP16 / FP32 precision.
     """
     model.train()
     running_loss = 0.0
@@ -230,7 +300,6 @@ def train_epoch(model, loader, optimizer, loss_fn, device, epoch, total_epochs, 
 
         loss_val = loss.item()
         running_loss += loss_val * images.size(0)
-
         pbar.set_postfix({"loss": f"{loss_val:.4f}"})
 
     epoch_loss = running_loss / len(loader.dataset)
@@ -238,16 +307,25 @@ def train_epoch(model, loader, optimizer, loss_fn, device, epoch, total_epochs, 
     return epoch_loss, elapsed
 
 
-def validate_epoch(model, loader, device, use_amp=True, val_min_size=30):
+def validate_epoch(model, loader, device, use_amp=True, val_min_size=10):
     """
-    Evaluates MONAI UNet on full patient validation scans.
-    Reconstructs 3D patient volumes to compute 3D Patient Volumetric Dice & 2D Tumor Slice Dice.
+    Evaluates MONAI UNet on validation set with macro-aggregated per-sample metrics:
+    - Dice, IoU, Precision, Sensitivity (Recall), Specificity, HD95, ASD, Failure Rate, 3D Volumetric Dice.
     """
     model.eval()
 
     patient_3d_preds = {}
     patient_3d_gts = {}
-    pos_slice_dices = []
+
+    sample_dices = []
+    sample_ious = []
+    sample_precisions = []
+    sample_sensitivities = []
+    sample_specificities = []
+    sample_hd95s = []
+    sample_asds = []
+    failures = 0
+    total_pos_samples = 0
 
     pbar = tqdm(loader, desc="[Val]", leave=False, dynamic_ncols=True)
     with torch.no_grad():
@@ -263,7 +341,6 @@ def validate_epoch(model, loader, device, use_amp=True, val_min_size=30):
                 logits = model(images)
 
             preds_raw = (torch.sigmoid(logits) > 0.5).float()
-
             preds_np = preds_raw.cpu().numpy()
             masks_np = masks.cpu().numpy()
 
@@ -276,20 +353,41 @@ def validate_epoch(model, loader, device, use_amp=True, val_min_size=30):
                 if val_min_size > 0:
                     p_mask = remove_small_objects(p_mask, min_size=val_min_size)
 
-                # Store for 3D patient reconstruction
+                # Store for 3D patient volume reconstruction
                 if pid not in patient_3d_preds:
                     patient_3d_preds[pid] = {}
                     patient_3d_gts[pid] = {}
                 patient_3d_preds[pid][s_idx] = p_mask
                 patient_3d_gts[pid][s_idx] = g_mask
 
-                # 2D Slice Dice (positive tumor slices)
-                p_sum = np.sum(p_mask)
                 g_sum = np.sum(g_mask)
-                if g_sum > 0:
-                    intersection = np.sum(p_mask * g_mask)
-                    dice_2d = (2.0 * intersection) / (p_sum + g_sum + 1e-8)
-                    pos_slice_dices.append(dice_2d)
+                if g_sum > 0:  # Macro-evaluation on positive tumor slices
+                    total_pos_samples += 1
+                    tp = np.sum(p_mask * g_mask)
+                    fp = np.sum(p_mask * (1.0 - g_mask))
+                    fn = np.sum((1.0 - p_mask) * g_mask)
+                    tn = np.sum((1.0 - p_mask) * (1.0 - g_mask))
+
+                    dice = (2.0 * tp) / (2.0 * tp + fp + fn + 1e-8)
+                    iou = tp / (tp + fp + fn + 1e-8)
+                    prec = tp / (tp + fp + 1e-8)
+                    sens = tp / (tp + fn + 1e-8)
+                    spec = tn / (tn + fp + 1e-8)
+
+                    sample_dices.append(dice)
+                    sample_ious.append(iou)
+                    sample_precisions.append(prec)
+                    sample_sensitivities.append(sens)
+                    sample_specificities.append(spec)
+
+                    if dice < 0.1:  # Nodule detection failure threshold
+                        failures += 1
+
+                    # Surface distances (HD95 & ASD)
+                    hd95, asd = compute_surface_distances(p_mask > 0, g_mask > 0)
+                    if not np.isnan(hd95):
+                        sample_hd95s.append(hd95)
+                        sample_asds.append(asd)
 
     # Compute 3D Volumetric Dice on tumor-bearing patient scans
     patient_3d_dices = []
@@ -299,20 +397,32 @@ def validate_epoch(model, loader, device, use_amp=True, val_min_size=30):
         vol_gt = np.stack([patient_3d_gts[pid][k] for k in s_keys], axis=-1)
 
         v_gt_sum = np.sum(vol_gt)
-        if v_gt_sum > 0:  # Only compute 3D volumetric dice on patients with actual nodules
+        if v_gt_sum > 0:
             inter = np.sum(vol_pred * vol_gt)
             v_pred_sum = np.sum(vol_pred)
             p_dice = (2.0 * inter) / (v_pred_sum + v_gt_sum + 1e-8)
             patient_3d_dices.append(p_dice)
 
-    mean_3d_vol_dice = float(np.mean(patient_3d_dices)) if patient_3d_dices else 0.0
-    mean_pos_slice_dice = float(np.mean(pos_slice_dices)) if pos_slice_dices else 0.0
+    metrics = {
+        "dice": float(np.mean(sample_dices)) if sample_dices else 0.0,
+        "iou": float(np.mean(sample_ious)) if sample_ious else 0.0,
+        "precision": float(np.mean(sample_precisions)) if sample_precisions else 0.0,
+        "sensitivity": float(np.mean(sample_sensitivities)) if sample_sensitivities else 0.0,
+        "specificity": float(np.mean(sample_specificities)) if sample_specificities else 0.0,
+        "hd95": float(np.mean(sample_hd95s)) if sample_hd95s else 0.0,
+        "asd": float(np.mean(sample_asds)) if sample_asds else 0.0,
+        "failure_rate": float(failures / total_pos_samples) if total_pos_samples > 0 else 0.0,
+        "val_3d_dice": float(np.mean(patient_3d_dices)) if patient_3d_dices else 0.0
+    }
 
-    return mean_3d_vol_dice, mean_pos_slice_dice
+    # Combined composite validation score for robust model selection (Dice + IoU + Sensitivity)
+    metrics["composite_score"] = (metrics["dice"] + metrics["iou"] + metrics["sensitivity"]) / 3.0
+
+    return metrics
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Train MONAI 2D UNet Model on LIDC-IDRI Dataset (3D Volumetric Validation & AMP FP16)")
+    parser = argparse.ArgumentParser(description="Train MONAI 2D UNet Model on LIDC-IDRI Dataset")
     parser.add_argument("--manifest", type=str, default=DEFAULT_MANIFEST, help=f"Path to master manifest CSV (default: {DEFAULT_MANIFEST})")
     parser.add_argument("--epochs", type=int, default=DEFAULT_EPOCHS, help=f"Total target training epochs (default: {DEFAULT_EPOCHS})")
     parser.add_argument("--batch_size", type=int, default=DEFAULT_BATCH_SIZE, help=f"Batch size for training (default: {DEFAULT_BATCH_SIZE})")
@@ -323,21 +433,15 @@ def main():
     parser.add_argument("--num_workers", type=int, default=DEFAULT_NUM_WORKERS, help=f"DataLoader num_workers (default: {DEFAULT_NUM_WORKERS})")
     parser.add_argument("--save_path", type=str, default=DEFAULT_SAVE_PATH, help=f"Path to save best model checkpoint (default: {DEFAULT_SAVE_PATH})")
     parser.add_argument("--checkpoint_path", type=str, default=DEFAULT_CHECKPOINT_PATH, help=f"Path to save/load latest epoch checkpoint (default: {DEFAULT_CHECKPOINT_PATH})")
+    parser.add_argument("--results_log", type=str, default=DEFAULT_RESULTS_LOG, help=f"Path to results log text file (default: {DEFAULT_RESULTS_LOG})")
     parser.add_argument("--resume", action="store_true", help="Resume training from latest checkpoint if available")
 
     args = parser.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"=======================================================")
-    print(f"Using Compute Device: {device}")
     if device.type == "cuda":
-        print(f"GPU Name: {torch.cuda.get_device_name(0)}")
-        print(f"GPU VRAM: {torch.cuda.get_device_properties(0).total_memory / 1e9:.2f} GB")
         torch.backends.cudnn.benchmark = True
-    print(f"DataLoader Settings: num_workers={args.num_workers}, pin_memory={device.type == 'cuda'}")
-    print(f"=======================================================\n")
 
-    # Load Transforms & Datasets
     train_transforms, val_transforms = get_transforms()
 
     train_dataset = LIDC2DDataset(args.manifest, split="train", transform=train_transforms)
@@ -365,7 +469,6 @@ def main():
         worker_init_fn=worker_init_fn if args.num_workers > 0 else None
     )
 
-    # Instantiate MONAI 2D UNet Architecture
     unet_channels = (16, 32, 64, 128, 256)
     model_kwargs = {
         "spatial_dims": 2,
@@ -373,86 +476,84 @@ def main():
         "out_channels": 1,
         "channels": unet_channels,
         "strides": (2, 2, 2, 2),
-        "num_res_units": 2
+        #"num_res_units": 2
     }
     
-    model = UNet(**model_kwargs).to(device)
-    arch_name = "MONAI 2D UNet"
-
-    num_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    model = AttentionUnet(**model_kwargs).to(device)
 
     loss_fn = DiceFocalLoss(sigmoid=True, squared_pred=True, gamma=2.0)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay, fused=True if device.type == 'cuda' else False)
     scaler = torch.amp.GradScaler('cuda') if device.type == "cuda" else None
 
     start_epoch = 1
-    best_val_dice = 0.0
-    history = {"epoch": [], "train_loss": [], "val_3d_dice": [], "val_pos_dice": []}
+    best_composite_score = 0.0
+    history = {
+        "epoch": [], "train_loss": [], "val_3d_dice": [], "val_pos_dice": [],
+        "val_iou": [], "val_prec": [], "val_sens": [], "val_spec": [],
+        "val_hd95": [], "val_asd": [], "val_fail_rate": [], "composite_score": []
+    }
 
     # Resume capability from checkpoint
-    if args.resume:
-        if os.path.exists(args.checkpoint_path):
-            print(f"--> Found existing checkpoint '{args.checkpoint_path}'. Resuming training...")
-            checkpoint = torch.load(args.checkpoint_path, map_location=device)
-            model.load_state_dict(checkpoint["model_state_dict"])
-            optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+    if args.resume and os.path.exists(args.checkpoint_path):
+        checkpoint = torch.load(args.checkpoint_path, map_location=device)
+        model.load_state_dict(checkpoint["model_state_dict"])
+        optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+        start_epoch = checkpoint["epoch"] + 1
+        best_composite_score = checkpoint.get("best_composite_score", 0.0)
+        history = checkpoint.get("history", history)
 
-            start_epoch = checkpoint["epoch"] + 1
-            best_val_dice = checkpoint.get("best_val_dice", 0.0)
-            history = checkpoint.get("history", history)
+        if "scaler_state_dict" in checkpoint and scaler is not None and checkpoint.get("scaler_state_dict") is not None:
+            scaler.load_state_dict(checkpoint["scaler_state_dict"])
 
-            if "scaler_state_dict" in checkpoint and scaler is not None and checkpoint.get("scaler_state_dict") is not None:
-                scaler.load_state_dict(checkpoint["scaler_state_dict"])
+        for param_group in optimizer.param_groups:
+            param_group["lr"] = args.lr
 
-            if start_epoch > args.epochs:
-                print(f"--> Note: Checkpoint is at epoch {checkpoint['epoch']}, but target --epochs is set to {args.epochs}.")
-                print(f"    Please pass a higher --epochs argument (e.g., --epochs {checkpoint['epoch'] + 30}) to train further.")
-
-            old_lr = optimizer.param_groups[0]["lr"]
-            for param_group in optimizer.param_groups:
-                param_group["lr"] = args.lr
-            print(f"--> Active Learning Rate set to: {args.lr:.2e} (was {old_lr:.2e}).")
-
-            remaining_epochs = max(1, args.epochs - start_epoch + 1)
-            scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=remaining_epochs, eta_min=args.min_lr)
-            print(f"--> Resuming from Epoch {start_epoch}. Continuing to target Epoch {args.epochs}. Previous Best Val 3D Dice: {best_val_dice:.4f}\n")
-        else:
-            print(f"--> Note: --resume flag was set, but checkpoint file '{args.checkpoint_path}' does not exist yet. Starting training from scratch.\n")
-            scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs, eta_min=args.min_lr)
+        remaining_epochs = max(1, args.epochs - start_epoch + 1)
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=remaining_epochs, eta_min=args.min_lr)
     else:
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs, eta_min=args.min_lr)
 
-    print(f"\nStarting Training: {arch_name} (AMP FP16) | Channels: {unet_channels} ({num_params/1e6:.2f}M Params) | Target Epochs: {args.epochs} | Batch Size: {args.batch_size} | Workers: {args.num_workers}\n", flush=True)
+    # Initialize results log file header if starting fresh
+    if not args.resume or not os.path.exists(args.results_log):
+        with open(args.results_log, "a") as f:
+            f.write(f"\n--- Training Session Started: {time.strftime('%Y-%m-%d %H:%M:%S')} ---\n")
+            f.write("Epoch | Loss | Dice | IoU | Precision | Sensitivity | Specificity | HD95(mm) | ASD(mm) | FailRate | 3DDice | CompositeScore\n")
 
     total_start = time.time()
     for epoch in range(start_epoch, args.epochs + 1):
         train_loss, train_time = train_epoch(model, train_loader, optimizer, loss_fn, device, epoch, args.epochs, scaler=scaler)
-        val_3d_dice, val_pos_dice = validate_epoch(model, val_loader, device, use_amp=True, val_min_size=args.val_min_size)
+        val_metrics = validate_epoch(model, val_loader, device, use_amp=True, val_min_size=args.val_min_size)
         current_lr = optimizer.param_groups[0]["lr"]
 
         scheduler.step()
 
         history["epoch"].append(epoch)
         history["train_loss"].append(train_loss)
-        history["val_3d_dice"].append(val_3d_dice)
-        history["val_pos_dice"].append(val_pos_dice)
+        history["val_3d_dice"].append(val_metrics["val_3d_dice"])
+        history["val_pos_dice"].append(val_metrics["dice"])
+        history["val_iou"].append(val_metrics["iou"])
+        history["val_prec"].append(val_metrics["precision"])
+        history["val_sens"].append(val_metrics["sensitivity"])
+        history["val_spec"].append(val_metrics["specificity"])
+        history["val_hd95"].append(val_metrics["hd95"])
+        history["val_asd"].append(val_metrics["asd"])
+        history["val_fail_rate"].append(val_metrics["failure_rate"])
+        history["composite_score"].append(val_metrics["composite_score"])
 
-        is_best = val_pos_dice > best_val_dice
+        is_best = val_metrics["composite_score"] > best_composite_score
         if is_best:
-            best_val_dice = val_pos_dice
+            best_composite_score = val_metrics["composite_score"]
             abs_save_path = os.path.abspath(args.save_path)
             os.makedirs(os.path.dirname(abs_save_path), exist_ok=True)
             torch.save({
                 "epoch": epoch,
                 "model_state_dict": model.state_dict(),
                 "optimizer_state_dict": optimizer.state_dict(),
-                "val_dice": val_pos_dice,
-                "val_3d_dice": val_3d_dice,
+                "val_dice": val_metrics["dice"],
+                "val_3d_dice": val_metrics["val_3d_dice"],
+                "val_metrics": val_metrics,
                 "model_kwargs": model_kwargs
             }, abs_save_path)
-            best_str = f" -> [BEST MODEL SAVED to {abs_save_path}]"
-        else:
-            best_str = ""
 
         # Save checkpoint after EVERY epoch
         checkpoint_data = {
@@ -461,22 +562,29 @@ def main():
             "optimizer_state_dict": optimizer.state_dict(),
             "scheduler_state_dict": scheduler.state_dict(),
             "scaler_state_dict": scaler.state_dict() if scaler is not None else None,
-            "best_val_dice": best_val_dice,
+            "best_composite_score": best_composite_score,
             "history": history,
             "model_kwargs": model_kwargs
         }
         torch.save(checkpoint_data, args.checkpoint_path)
         plot_training_history(history, save_path="training_history.png")
 
-        print(f"Epoch {epoch:02d}/{args.epochs:02d} | Train Loss: {train_loss:.4f} | Val 3D Vol Dice: {val_3d_dice:.4f} (2D Tumor Dice: {val_pos_dice:.4f}) | LR: {current_lr:.2e} | Time: {train_time:.1f}s{best_str}")
+        # Format clean metric log string
+        log_line = (
+            f"Epoch {epoch:02d}/{args.epochs:02d} | Loss: {train_loss:.4f} | "
+            f"Dice: {val_metrics['dice']:.4f} | IoU: {val_metrics['iou']:.4f} | "
+            f"Prec: {val_metrics['precision']:.4f} | Sens: {val_metrics['sensitivity']:.4f} | "
+            f"Spec: {val_metrics['specificity']:.4f} | HD95: {val_metrics['hd95']:.2f}mm | "
+            f"ASD: {val_metrics['asd']:.2f}mm | FailRate: {val_metrics['failure_rate']*100:.1f}% | "
+            f"3DDice: {val_metrics['val_3d_dice']:.4f} | Score: {val_metrics['composite_score']:.4f}"
+        )
 
-    total_elapsed = time.time() - total_start
+        # Print clean single-line metric status to console
+        print(log_line, flush=True)
 
-    print(f"\n=======================================================")
-    print(f"Training Complete in {total_elapsed / 60:.2f} minutes!")
-    print(f"Best Validation 3D Volumetric Dice Score: {best_val_dice:.4f}")
-    print(f"Saved Best Model to: {args.save_path}")
-    print(f"=======================================================")
+        # Write log entry to results.txt file
+        with open(args.results_log, "a") as f:
+            f.write(f"{epoch:02d} | {train_loss:.4f} | {val_metrics['dice']:.4f} | {val_metrics['iou']:.4f} | {val_metrics['precision']:.4f} | {val_metrics['sensitivity']:.4f} | {val_metrics['specificity']:.4f} | {val_metrics['hd95']:.2f} | {val_metrics['asd']:.2f} | {val_metrics['failure_rate']*100:.1f}% | {val_metrics['val_3d_dice']:.4f} | {val_metrics['composite_score']:.4f}\n")
 
     plot_training_history(history, save_path="training_history.png")
 
