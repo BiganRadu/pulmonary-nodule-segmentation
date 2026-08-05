@@ -17,29 +17,30 @@ if sys.platform == "win32":
             except Exception:
                 pass
 
-# 3rd party
-import numpy as np
-import pandas as pd
-import matplotlib.pyplot as plt
-from scipy.ndimage import label
-from tqdm import tqdm
-
 # PyTorch & MONAI
 import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
-from monai.networks.nets import UNet
+from monai.networks.nets import UNet, AttentionUnet
+
+# 3rd party
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from scipy.ndimage import label, binary_erosion, find_objects
+from tqdm import tqdm
 
 # Local imports
 from train import LIDC2DDataset, get_transforms
 
 # Default Configuration Constants
 DEFAULT_MANIFEST = "preprocessed_data2/dataset_manifest.csv"
-DEFAULT_MODEL_PATH = "latest_checkpoint.pth"
+DEFAULT_MODEL_PATH = "models/attention_unet/attention_unet.pth"
 DEFAULT_BATCH_SIZE = 32
 DEFAULT_NUM_WORKERS = 8
 DEFAULT_MIN_SIZE = 10
 DEFAULT_OUTPUT_PREVIEW = "test_predictions_preview.png"
+DEFAULT_REPORT_PATH = "test_evaluation_report.txt"
 
 
 def remove_small_objects(binary_mask, min_size=DEFAULT_MIN_SIZE):
@@ -60,25 +61,137 @@ def remove_small_objects(binary_mask, min_size=DEFAULT_MIN_SIZE):
     return cleaned_mask
 
 
-def evaluate_test_set(model, loader, device, min_size=30):
+def compute_surface_distances(pred_binary, gt_binary):
     """
-    Evaluates trained MONAI UNet model on unseen Test split in standard FP32 precision.
-    Computes 2D Tumor Slice Dice, 3D Patient Volumetric Dice, Precision, Recall, and IoU.
+    Computes 95th Percentile Hausdorff Distance (HD95) and Average Surface Distance (ASD)
+    between 2D/3D binary prediction and ground truth masks.
+    Returns (np.nan, np.nan) if either mask is empty.
+    """
+    if np.sum(pred_binary) == 0 or np.sum(gt_binary) == 0:
+        return np.nan, np.nan
+
+    pred_border = pred_binary ^ binary_erosion(pred_binary)
+    gt_border = gt_binary ^ binary_erosion(gt_binary)
+
+    pred_pts = np.argwhere(pred_border)
+    gt_pts = np.argwhere(gt_border)
+
+    if len(pred_pts) == 0 or len(gt_pts) == 0:
+        return np.nan, np.nan
+
+    # Distance matrix using broadcasting
+    d_p2g = np.min(np.linalg.norm(pred_pts[:, None, :] - gt_pts[None, :, :], axis=2), axis=1)
+    d_g2p = np.min(np.linalg.norm(gt_pts[:, None, :] - pred_pts[None, :, :], axis=2), axis=1)
+
+    all_dists = np.concatenate([d_p2g, d_g2p])
+    hd95 = float(np.percentile(all_dists, 95))
+    asd = float(np.mean(all_dists))
+    return hd95, asd
+
+
+def compute_single_mask_metrics(p_mask, g_mask):
+    """
+    Computes Dice, IoU, Precision, Sensitivity, Specificity, HD95, ASD, and Failure flag
+    with explicit handling for empty masks.
+    """
+    p_sum = np.sum(p_mask)
+    g_sum = np.sum(g_mask)
+
+    tp = np.sum(p_mask * g_mask)
+    fp = np.sum(p_mask * (1.0 - g_mask))
+    fn = np.sum((1.0 - p_mask) * g_mask)
+    tn = np.sum((1.0 - p_mask) * (1.0 - g_mask))
+
+    # Case 1: Both GT and Pred are empty (Perfect negative match)
+    if g_sum == 0 and p_sum == 0:
+        return {
+            "dice": 1.0, "iou": 1.0, "precision": 1.0, "sensitivity": 1.0, "specificity": 1.0,
+            "hd95": 0.0, "asd": 0.0, "is_failure": False, "is_empty_gt": True
+        }
+
+    # Case 2: GT is empty, but Pred contains false positives
+    if g_sum == 0 and p_sum > 0:
+        spec = tn / (tn + fp + 1e-8)
+        return {
+            "dice": 0.0, "iou": 0.0, "precision": 0.0, "sensitivity": 1.0, "specificity": spec,
+            "hd95": np.nan, "asd": np.nan, "is_failure": True, "is_empty_gt": True
+        }
+
+    # Case 3: GT is non-empty, but Pred is empty (False Negative / Miss)
+    if g_sum > 0 and p_sum == 0:
+        return {
+            "dice": 0.0, "iou": 0.0, "precision": 0.0, "sensitivity": 0.0, "specificity": 1.0,
+            "hd95": np.nan, "asd": np.nan, "is_failure": True, "is_empty_gt": False
+        }
+
+    # Case 4: Both GT and Pred are non-empty
+    dice = (2.0 * tp) / (2.0 * tp + fp + fn + 1e-8)
+    iou = tp / (tp + fp + fn + 1e-8)
+    prec = tp / (tp + fp + 1e-8)
+    sens = tp / (tp + fn + 1e-8)
+    spec = tn / (tn + fp + 1e-8)
+
+    hd95, asd = compute_surface_distances(p_mask > 0, g_mask > 0)
+    is_failure = bool(dice < 0.1)
+
+    return {
+        "dice": dice, "iou": iou, "precision": prec, "sensitivity": sens, "specificity": spec,
+        "hd95": hd95, "asd": asd, "is_failure": is_failure, "is_empty_gt": False
+    }
+
+
+def aggregate_metric_dict(list_of_metric_dicts):
+    """
+    Summarizes a list of metric dicts into mean values and failure rates.
+    """
+    if not list_of_metric_dicts:
+        return {
+            "dice": 0.0, "iou": 0.0, "precision": 0.0, "sensitivity": 0.0, "specificity": 0.0,
+            "hd95": 0.0, "asd": 0.0, "failure_rate": 0.0, "count": 0
+        }
+
+    dices = [m["dice"] for m in list_of_metric_dicts]
+    ious = [m["iou"] for m in list_of_metric_dicts]
+    precs = [m["precision"] for m in list_of_metric_dicts]
+    senss = [m["sensitivity"] for m in list_of_metric_dicts]
+    specs = [m["specificity"] for m in list_of_metric_dicts]
+
+    hd95s = [m["hd95"] for m in list_of_metric_dicts if not np.isnan(m["hd95"])]
+    asds = [m["asd"] for m in list_of_metric_dicts if not np.isnan(m["asd"])]
+    failures = [1.0 if m["is_failure"] else 0.0 for m in list_of_metric_dicts]
+
+    return {
+        "dice": float(np.mean(dices)),
+        "iou": float(np.mean(ious)),
+        "precision": float(np.mean(precs)),
+        "sensitivity": float(np.mean(senss)),
+        "specificity": float(np.mean(specs)),
+        "hd95": float(np.mean(hd95s)) if hd95s else 0.0,
+        "asd": float(np.mean(asds)) if asds else 0.0,
+        "failure_rate": float(np.mean(failures)),
+        "count": len(list_of_metric_dicts)
+    }
+
+
+def evaluate_test_set_hierarchical(model, loader, device, min_size=10):
+    """
+    Comprehensive hierarchical evaluation:
+    1. Per-Slice evaluation (All slices & Positive tumor slices)
+    2. Per-Patient evaluation (Full 3D patient volume reconstruction)
+    3. Per-Nodule 3D evaluation & size stratification (Small, Medium, Large nodules)
     """
     model.eval()
 
     patient_3d_preds = {}
     patient_3d_gts = {}
-    pos_slice_dices = []
 
-    total_intersection = 0.0
-    total_pred_mask = 0.0
-    total_gt_mask = 0.0
+    slice_metrics_all = []
+    slice_metrics_pos = []
 
-    print(f"Evaluating MONAI 2D UNet model on Test Set (Component filter ≥{min_size}px)...")
+    print(f"\nRunning Comprehensive Evaluation on Test Set (Component filter ≥{min_size}px)...")
 
     with torch.no_grad():
-        for batch in tqdm(loader, desc="[Evaluating Test Set]"):
+        for batch in tqdm(loader, desc="[Evaluating Test Slices]"):
             images, masks, pids, s_idxs = batch[0], batch[1], batch[2], batch[3]
             images = images.to(device, non_blocking=True)
             masks = masks.to(device, non_blocking=True)
@@ -98,52 +211,119 @@ def evaluate_test_set(model, loader, device, min_size=30):
                 if min_size > 0:
                     p_mask = remove_small_objects(p_mask, min_size=min_size)
 
-                # Store slice for 3D patient volume reconstruction
+                # Store for 3D patient reconstruction
                 if pid not in patient_3d_preds:
                     patient_3d_preds[pid] = {}
                     patient_3d_gts[pid] = {}
                 patient_3d_preds[pid][s_idx] = p_mask
                 patient_3d_gts[pid][s_idx] = g_mask
 
-                # Global voxel counters
-                inter = np.sum(p_mask * g_mask)
-                p_sum = np.sum(p_mask)
-                g_sum = np.sum(g_mask)
+                # 1. Per-Slice Metric Computation
+                m_slice = compute_single_mask_metrics(p_mask, g_mask)
+                slice_metrics_all.append(m_slice)
+                if not m_slice["is_empty_gt"]:
+                    slice_metrics_pos.append(m_slice)
 
-                total_intersection += inter
-                total_pred_mask += p_sum
-                total_gt_mask += g_sum
+    # 2. Per-Patient 3D Volume Evaluation & Per-Patient Row Collection
+    patient_metrics_all = []
+    patient_metrics_pos = []
+    per_patient_rows = []
 
-                # 2D Slice Dice on positive tumor slices
-                if g_sum > 0:
-                    dice_2d = (2.0 * inter) / (p_sum + g_sum + 1e-8)
-                    pos_slice_dices.append(dice_2d)
+    # 3. Per-Nodule 3D Evaluation & Size Stratification
+    nodule_metrics_all = []
+    nodule_metrics_small = []   # < 100 voxels
+    nodule_metrics_medium = []  # 100 - 1000 voxels
+    nodule_metrics_large = []   # >= 1000 voxels
 
-    # Compute 3D Volumetric Dice on tumor-bearing patient scans
-    patient_3d_dices = []
-    for pid in patient_3d_preds:
+    for pid in tqdm(sorted(patient_3d_preds.keys()), desc="[3D Patient & Nodule Reconstruction]"):
         s_keys = sorted(patient_3d_preds[pid].keys())
         vol_pred = np.stack([patient_3d_preds[pid][k] for k in s_keys], axis=-1)
         vol_gt = np.stack([patient_3d_gts[pid][k] for k in s_keys], axis=-1)
 
-        v_gt_sum = np.sum(vol_gt)
-        if v_gt_sum > 0:
-            inter = np.sum(vol_pred * vol_gt)
-            v_pred_sum = np.sum(vol_pred)
-            p_dice = (2.0 * inter) / (v_pred_sum + v_gt_sum + 1e-8)
-            patient_3d_dices.append(p_dice)
+        m_patient = compute_single_mask_metrics(vol_pred, vol_gt)
+        patient_metrics_all.append(m_patient)
+        if not m_patient["is_empty_gt"]:
+            patient_metrics_pos.append(m_patient)
 
-    mean_2d_dice = float(np.mean(pos_slice_dices)) if pos_slice_dices else 0.0
-    mean_3d_dice = float(np.mean(patient_3d_dices)) if patient_3d_dices else 0.0
+        # Compute 2D slice metrics for this patient (both tumor slices and all slices)
+        patient_2d_tumor_metrics = []
+        patient_2d_all_metrics = []
+        has_tumor_scan = (np.sum(vol_gt) > 0)
+        num_tumor_slices = 0
 
-    precision = total_intersection / (total_pred_mask + 1e-8)
-    recall = total_intersection / (total_gt_mask + 1e-8)
-    iou = total_intersection / (total_pred_mask + total_gt_mask - total_intersection + 1e-8)
+        for k in s_keys:
+            p_slice = patient_3d_preds[pid][k]
+            g_slice = patient_3d_gts[pid][k]
+            m_2d = compute_single_mask_metrics(p_slice, g_slice)
+            patient_2d_all_metrics.append(m_2d)
 
-    return mean_2d_dice, mean_3d_dice, precision, recall, iou
+            if np.sum(g_slice) > 0:
+                num_tumor_slices += 1
+                patient_2d_tumor_metrics.append(m_2d)
+
+        agg_tumor_2d = aggregate_metric_dict(patient_2d_tumor_metrics)
+        agg_all_2d = aggregate_metric_dict(patient_2d_all_metrics)
+
+        per_patient_rows.append({
+            "patient_id": pid,
+            "total_slices": len(s_keys),
+            "tumor_slices": num_tumor_slices,
+            "has_tumor": 1 if has_tumor_scan else 0,
+            "dice_2d_tumor": agg_tumor_2d["dice"] if has_tumor_scan else 1.0,
+            "dice_2d_all": agg_all_2d["dice"],
+            "iou_2d_tumor": agg_tumor_2d["iou"] if has_tumor_scan else 1.0,
+            "precision_2d_tumor": agg_tumor_2d["precision"] if has_tumor_scan else 1.0,
+            "sensitivity_2d_tumor": agg_tumor_2d["sensitivity"] if has_tumor_scan else 1.0,
+            "specificity_2d_all": agg_all_2d["specificity"],
+            "hd95_2d_tumor": agg_tumor_2d["hd95"] if has_tumor_scan else 0.0,
+            "asd_2d_tumor": agg_tumor_2d["asd"] if has_tumor_scan else 0.0,
+            "dice_3d_vol": m_patient["dice"]
+        })
+
+        # Extract individual 3D connected nodule lesions using 3D labeling
+        if np.sum(vol_gt) > 0:
+            labeled_gt, num_nodules = label(vol_gt > 0)
+            slices = find_objects(labeled_gt)
+
+            for n_idx, bbox in enumerate(slices, 1):
+                if bbox is None:
+                    continue
+                nodule_gt_mask = (labeled_gt[bbox] == n_idx)
+                nodule_pred_mask = vol_pred[bbox] * nodule_gt_mask
+
+                vol_voxels = int(np.sum(nodule_gt_mask))
+                m_nodule = compute_single_mask_metrics(nodule_pred_mask, nodule_gt_mask)
+                nodule_metrics_all.append(m_nodule)
+
+                if vol_voxels < 100:
+                    nodule_metrics_small.append(m_nodule)
+                elif vol_voxels < 1000:
+                    nodule_metrics_medium.append(m_nodule)
+                else:
+                    nodule_metrics_large.append(m_nodule)
+
+    # Export per-patient breakdown CSV
+    df_patients = pd.DataFrame(per_patient_rows)
+    df_patients.to_csv("patient_evaluation_breakdown.csv", index=False)
+    print("Saved individual per-patient breakdown to: patient_evaluation_breakdown.csv")
+
+    # Aggregate summaries
+    results = {
+        "slice_all": aggregate_metric_dict(slice_metrics_all),
+        "slice_pos": aggregate_metric_dict(slice_metrics_pos),
+        "patient_all": aggregate_metric_dict(patient_metrics_all),
+        "patient_pos": aggregate_metric_dict(patient_metrics_pos),
+        "nodule_all": aggregate_metric_dict(nodule_metrics_all),
+        "nodule_small": aggregate_metric_dict(nodule_metrics_small),
+        "nodule_medium": aggregate_metric_dict(nodule_metrics_medium),
+        "nodule_large": aggregate_metric_dict(nodule_metrics_large),
+        "per_patient_df": df_patients
+    }
+
+    return results
 
 
-def save_visual_predictions(model, test_dataset, device, output_path="test_predictions_preview.png", num_samples=6, min_size=30):
+def save_visual_predictions(model, test_dataset, device, output_path="test_predictions_preview.png", num_samples=6, min_size=10):
     """
     Saves visual side-by-side comparison PNG previews:
     [Input CT Image] vs [Ground Truth Mask] vs [Model Prediction Overlay]
@@ -201,28 +381,87 @@ def save_visual_predictions(model, test_dataset, device, output_path="test_predi
     print(f"Saved visual predictions preview to: {output_path}")
 
 
+def print_and_format_report(results, min_size, report_path=DEFAULT_REPORT_PATH):
+    """
+    Formats clean metric tables and saves full report to file.
+    """
+    lines = []
+    lines.append("=========================================================================================================")
+    lines.append(f"                   HIERARCHICAL EVALUATION REPORT - MONAI 2D UNET (Filter ≥{min_size}px)")
+    lines.append("=========================================================================================================\n")
+
+    def format_row(title, m):
+        return (
+            f"  {title:<32s} | Dice: {m['dice']:.4f} | IoU: {m['iou']:.4f} | "
+            f"Prec: {m['precision']:.4f} | Sens: {m['sensitivity']:.4f} | Spec: {m['specificity']:.4f} | "
+            f"HD95: {m['hd95']:5.2f}mm | ASD: {m['asd']:5.2f}mm | Fail: {m['failure_rate']*100:5.1f}% | Count: {m['count']:4d}"
+        )
+
+    lines.append("1. PER-SLICE EVALUATION:")
+    lines.append("---------------------------------------------------------------------------------------------------------")
+    lines.append(format_row("2D Slices (Tumor Slices Only)", results["slice_pos"]))
+    lines.append(format_row("2D Slices (All Test Slices)", results["slice_all"]))
+    lines.append("")
+
+    lines.append("2. PER-PATIENT 3D RECONSTRUCTION EVALUATION:")
+    lines.append("---------------------------------------------------------------------------------------------------------")
+    lines.append(format_row("3D Patients (Nodule Scans Only)", results["patient_pos"]))
+    lines.append(format_row("3D Patients (All Test Patients)", results["patient_all"]))
+    lines.append("")
+
+    lines.append("3. PER-NODULE 3D LESION & SIZE STRATIFICATION:")
+    lines.append("---------------------------------------------------------------------------------------------------------")
+    lines.append(format_row("3D Nodules (All Nodule Lesions)", results["nodule_all"]))
+    lines.append(format_row("Small Nodules  (< 100 voxels)", results["nodule_small"]))
+    lines.append(format_row("Medium Nodules (100 - 1000 voxels)", results["nodule_medium"]))
+    lines.append(format_row("Large Nodules  (>= 1000 voxels)", results["nodule_large"]))
+    lines.append("")
+
+    if "per_patient_df" in results:
+        df_p = results["per_patient_df"]
+        lines.append("4. INDIVIDUAL PER-PATIENT BREAKDOWN SAMPLE (Tumor Scans - 2D & 3D Metrics):")
+        lines.append("---------------------------------------------------------------------------------------------------------")
+        lines.append("  Patient ID          | Slices (Tumor) | 2D Tumor Dice | 2D All Dice | 2D Tum IoU | 2D Tum Prec | 2D Tum Sens | 3D Vol Dice")
+        lines.append("  -----------------------------------------------------------------------------------------------------------------------")
+        tumor_patients = df_p[df_p["has_tumor"] == 1].head(15)
+        for _, r in tumor_patients.iterrows():
+            lines.append(
+                f"  {r['patient_id']:<19s} | {r['total_slices']:3d} ({r['tumor_slices']:3d})   | "
+                f"{r['dice_2d_tumor']:.4f}        | {r['dice_2d_all']:.4f}      | {r['iou_2d_tumor']:.4f}     | "
+                f"{r['precision_2d_tumor']:.4f}      | {r['sensitivity_2d_tumor']:.4f}      | {r['dice_3d_vol']:.4f}"
+            )
+        lines.append("  (Full table exported to patient_evaluation_breakdown.csv)")
+    lines.append("=========================================================================================================\n")
+
+    report_text = "\n".join(lines)
+    print(report_text)
+
+    with open(report_path, "w") as f:
+        f.write(report_text)
+    print(f"Saved evaluation report to: {report_path}")
+
+
 def main():
-    parser = argparse.ArgumentParser(description="Evaluate Trained MONAI 2D UNet Model on Test Set")
+    parser = argparse.ArgumentParser(description="Comprehensive Hierarchical Evaluation of MONAI 2D UNet")
     parser.add_argument("--manifest", type=str, default=DEFAULT_MANIFEST, help=f"Path to manifest CSV (default: {DEFAULT_MANIFEST})")
     parser.add_argument("--model_path", type=str, default=DEFAULT_MODEL_PATH, help=f"Path to trained model checkpoint (default: {DEFAULT_MODEL_PATH})")
     parser.add_argument("--batch_size", type=int, default=DEFAULT_BATCH_SIZE, help=f"Batch size for evaluation (default: {DEFAULT_BATCH_SIZE})")
     parser.add_argument("--num_workers", type=int, default=DEFAULT_NUM_WORKERS, help=f"DataLoader num_workers (default: {DEFAULT_NUM_WORKERS})")
     parser.add_argument("--min_size", type=int, default=DEFAULT_MIN_SIZE, help=f"Minimum connected component size (in pixels) to keep (default: {DEFAULT_MIN_SIZE})")
     parser.add_argument("--output_preview", type=str, default=DEFAULT_OUTPUT_PREVIEW, help=f"Path for prediction PNG (default: {DEFAULT_OUTPUT_PREVIEW})")
+    parser.add_argument("--report_path", type=str, default=DEFAULT_REPORT_PATH, help=f"Path for evaluation text report (default: {DEFAULT_REPORT_PATH})")
 
     args = parser.parse_args()
 
     if not os.path.exists(args.model_path):
-        print(f"Error: Model checkpoint file '{args.model_path}' not found. Please train a model first using train.py.")
+        print(f"Error: Model checkpoint file '{args.model_path}' not found. Please specify valid model path.")
         return
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Using Compute Device: {device}")
 
-    # Load Checkpoint & Instantiate MONAI 2D UNet
     checkpoint = torch.load(args.model_path, map_location=device)
-    val_dice_str = f" (Best Val Dice: {checkpoint.get('val_dice', 0.0):.4f})" if 'val_dice' in checkpoint else ""
-    print(f"Loading trained MONAI 2D UNet model from {args.model_path}{val_dice_str}...")
+    val_dice_str = f" (Val Dice: {checkpoint.get('val_dice', 0.0):.4f})" if 'val_dice' in checkpoint else ""
+    print(f"Loading MONAI 2D UNet model from {args.model_path}{val_dice_str}...")
 
     state_dict = checkpoint["model_state_dict"]
     if "model_kwargs" in checkpoint:
@@ -236,10 +475,10 @@ def main():
             "out_channels": 1,
             "channels": tuple(base * (2**i) for i in range(5)),
             "strides": (2, 2, 2, 2),
-            "num_res_units": 2
+            #"num_res_units": 2
         }
 
-    model = UNet(**model_kwargs).to(device)
+    model = AttentionUnet(**model_kwargs).to(device)
     model.load_state_dict(state_dict)
 
     _, val_transforms = get_transforms()
@@ -254,17 +493,8 @@ def main():
         prefetch_factor=2 if args.num_workers > 0 else None
     )
 
-    mean_2d_dice, mean_3d_dice, precision, recall, iou = evaluate_test_set(model, test_loader, device, min_size=args.min_size)
-
-    print(f"\n=======================================================")
-    print(f"TEST SET EVALUATION RESULTS (Component Filter ≥{args.min_size}px):")
-    print(f"  - 2D Tumor Slice Dice:      {mean_2d_dice:.4f}")
-    print(f"  - 3D Patient Volumetric Dice:{mean_3d_dice:.4f}")
-    print(f"  - Intersection/Union (IoU): {iou:.4f}")
-    print(f"  - Precision:                {precision:.4f}")
-    print(f"  - Recall:                   {recall:.4f}")
-    print(f"=======================================================")
-
+    results = evaluate_test_set_hierarchical(model, test_loader, device, min_size=args.min_size)
+    print_and_format_report(results, args.min_size, report_path=args.report_path)
     save_visual_predictions(model, test_dataset, device, output_path=args.output_preview, min_size=args.min_size)
 
 if __name__ == "__main__":
