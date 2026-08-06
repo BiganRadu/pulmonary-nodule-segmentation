@@ -1,7 +1,6 @@
 # ==========================================
 # Datasets & Large Data Directories
 # ==========================================
-preprocessed_data/
 scripts/
 *.zip
 
