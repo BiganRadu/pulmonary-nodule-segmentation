@@ -35,12 +35,12 @@ from train import LIDC2DDataset, get_transforms
 
 # Default Configuration Constants
 DEFAULT_MANIFEST = "preprocessed_data2/dataset_manifest.csv"
-DEFAULT_MODEL_PATH = "models/attention_unet/attention_unet.pth"
+DEFAULT_MODEL_PATH = "models/unet/unet.pth"
 DEFAULT_BATCH_SIZE = 32
 DEFAULT_NUM_WORKERS = 8
 DEFAULT_MIN_SIZE = 10
 DEFAULT_OUTPUT_PREVIEW = "test_predictions_preview.png"
-DEFAULT_REPORT_PATH = "test_evaluation_report.txt"
+DEFAULT_REPORT_PATH = "models/unet/test_evaluation_report.txt"
 
 
 def remove_small_objects(binary_mask, min_size=DEFAULT_MIN_SIZE):
@@ -475,10 +475,10 @@ def main():
             "out_channels": 1,
             "channels": tuple(base * (2**i) for i in range(5)),
             "strides": (2, 2, 2, 2),
-            #"num_res_units": 2
+            "num_res_units": 2
         }
 
-    model = AttentionUnet(**model_kwargs).to(device)
+    model = UNet(**model_kwargs).to(device)
     model.load_state_dict(state_dict)
 
     _, val_transforms = get_transforms()

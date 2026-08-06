@@ -27,15 +27,15 @@ from scipy.ndimage import label
 import torch
 import torch.nn.functional as F
 import monai
-from monai.networks.nets import UNet
+from monai.networks.nets import UNet, AttentionUnet
 
 # Default Configuration Constants
-DEFAULT_PATIENT_ID = "LIDC-IDRI-0002"
+DEFAULT_PATIENT_ID = "LIDC-IDRI-0035"
 DEFAULT_MANIFEST = "preprocessed_data2/dataset_manifest.csv"
-DEFAULT_MODEL_PATH = "models/unet/unet.pth"
+DEFAULT_MODEL_PATH = "models/attention_unet/attention_unet.pth"
 DEFAULT_MIN_SIZE = 10
 
-def remove_small_objects(binary_mask, min_size=30):
+def remove_small_objects(binary_mask, min_size):
     """
     Removes connected components in binary_mask that have fewer than min_size pixels.
     Eliminates small false positive noise predictions.
@@ -115,10 +115,10 @@ def load_trained_model(model_path, device):
             "out_channels": 1,
             "channels": tuple(base * (2**i) for i in range(5)),
             "strides": (2, 2, 2, 2),
-            "num_res_units": 2
+            # "num_res_units": 2
         }
 
-    model = UNet(**model_kwargs).to(device)
+    model = AttentionUnet(**model_kwargs).to(device)
     model.load_state_dict(state_dict)
     model.eval()
     return model

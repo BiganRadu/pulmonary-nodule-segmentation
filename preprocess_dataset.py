@@ -19,9 +19,9 @@ import matplotlib.pyplot as plt
 from scipy.ndimage import zoom, binary_fill_holes, label
 
 # Default Configuration Constants
-DEFAULT_DATASET_DIR = r"E:\CS2023-2027\AIMAS\practica\datasetmare"
+DEFAULT_DATASET_DIR = "/mnt/hdd/CS2023-2027/AIMAS/practica/datasetmare" if os.path.exists("/mnt/hdd/CS2023-2027/AIMAS/practica/datasetmare") else r"E:\CS2023-2027\AIMAS\practica\datasetmare"
 DEFAULT_OUTPUT_DIR = "preprocessed_data2"
-DEFAULT_NUM_WORKERS = 8
+DEFAULT_NUM_WORKERS = 6
 DEFAULT_NEG_POS_RATIO = 1.5
 DEFAULT_MAX_NEG_SLICES = 20
 DEFAULT_CONSENSUS_RATIO = 0.5  # 50% strict majority threshold
@@ -345,9 +345,9 @@ def canonical_reorient(volume, consensus_mask, session_masks, spatial_meta):
     x_dir = orient[0]  # Row direction X
     y_dir = orient[4]  # Col direction Y
 
-    vol_re = volume.copy()
-    con_re = consensus_mask.copy()
-    ses_re = session_masks.copy()
+    vol_re = volume
+    con_re = consensus_mask
+    ses_re = session_masks
 
     # Flip X if inverted
     if x_dir < 0:
@@ -619,7 +619,8 @@ def process_single_patient(
     max_neg_slices=DEFAULT_MAX_NEG_SLICES,
     crop_padding=DEFAULT_CROP_PADDING,
     lung_z_trim_ratio=DEFAULT_LUNG_Z_TRIM_RATIO,
-    keep_all_slices=False
+    keep_all_slices=False,
+    return_preview_data=False
 ):
     """
     Executes the Complete 9-Step Medically Correct DICOM Preprocessing Pipeline for a Single Patient.
@@ -632,9 +633,11 @@ def process_single_patient(
 
     # Step 2: Canonical Anatomical Orientation (RAS+ Alignment)
     vol_can, con_can, ses_can, spatial_meta = canonical_reorient(volume, orig_consensus_mask, orig_session_masks, spatial_meta)
+    del volume
 
     # Step 3: Isotropic / Uniform Spacing Resampling (1.0mm x 1.0mm x 1.0mm)
     res_vol, res_con, res_ses, spatial_meta = resample_volume_and_masks(vol_can, con_can, ses_can, spatial_meta)
+    del vol_can, con_can, ses_can
 
     # Step 8: Audit Nodule Volume Modifications After Resampling
     v_orig_mm3, v_res_mm3, v_ratio = audit_nodule_volume(orig_consensus_mask, res_con, spatial_meta['original_spacing'], DEFAULT_TARGET_SPACING)
@@ -646,10 +649,12 @@ def process_single_patient(
     crop_vol, crop_con, crop_ses, spatial_meta = crop_lung_cavity(
         norm_vol, res_vol, res_con, res_ses, spatial_meta, crop_padding, lung_z_trim_ratio
     )
+    del res_vol, norm_vol
 
     # Verify Inverse Geometry Mask Reconstruction (Step 7 validation)
     recon_mask = reverse_transform_mask(crop_con, spatial_meta)
     recon_dice = compute_pairwise_dice(orig_consensus_mask, recon_mask)
+    del recon_mask
 
     num_slices = crop_vol.shape[2]
     positive_slices = []
@@ -742,7 +747,20 @@ def process_single_patient(
         'recon_dice': recon_dice
     }
 
-    return manifest_entries, selected_slices, orig_consensus_mask, crop_con, spatial_meta, audit_record, summary_info
+    if return_preview_data:
+        preview_data = {
+            'selected_slices': selected_slices,
+            'orig_consensus': orig_consensus_mask,
+            'resamp_consensus': crop_con,
+            'spatial_meta': spatial_meta
+        }
+    else:
+        preview_data = None
+
+    del crop_vol, crop_con, crop_ses, orig_consensus_mask, orig_session_masks, res_con
+    gc.collect()
+
+    return manifest_entries, audit_record, summary_info, preview_data
 
 
 def save_verification_preview_4col(selected_slices, orig_consensus, resamp_consensus, spatial_meta, clean_id, out_png):
@@ -817,28 +835,24 @@ def process_patient_wrapper(args_tuple):
     pid, dataset_dir, output_dir, xml_index, split, crop_padding, lung_z_trim_ratio, keep_all_slices, save_preview_data = args_tuple
     should_keep_all = keep_all_slices or (split in ['val', 'test'])
     try:
-        entries, selected_slices, orig_con, res_con, spatial_meta, audit_record, summary_info = process_single_patient(
+        entries, audit_record, summary_info, preview_data = process_single_patient(
             pid,
             dataset_dir=dataset_dir,
             output_dir=output_dir,
             xml_index=xml_index,
             crop_padding=crop_padding,
             lung_z_trim_ratio=lung_z_trim_ratio,
-            keep_all_slices=should_keep_all
+            keep_all_slices=should_keep_all,
+            return_preview_data=save_preview_data
         )
         for entry in entries:
             entry['split'] = split
 
-        # Drop heavy 3D arrays if preview is not requested to prevent IPC memory bloat
-        if not save_preview_data:
-            orig_con = None
-            res_con = None
-
         gc.collect()
-        return True, pid, entries, selected_slices, orig_con, res_con, spatial_meta, audit_record, summary_info, None
+        return True, pid, entries, audit_record, summary_info, preview_data, None
     except Exception as e:
         gc.collect()
-        return False, pid, [], [], None, None, None, None, None, str(e)
+        return False, pid, [], None, None, None, str(e)
 
 
 def format_time(seconds):
@@ -922,7 +936,7 @@ def main():
 
     if len(tasks) == 1:
         res = process_patient_wrapper(tasks[0])
-        success, pid, entries, selected_slices, orig_con, res_con, spatial_meta, audit_record, summary_info, err = res
+        success, pid, entries, audit_record, summary_info, preview_data, err = res
         if success:
             all_manifest_entries.extend(entries)
             if audit_record:
@@ -933,9 +947,16 @@ def main():
             dice = summary_info['recon_dice']
             split = patient_splits.get(pid, 'N/A')
             print(f"[ 1/1 | 100.0% | Elapsed: 00:00 ] {pid:<15s} [{split:<5s}] -> Saved {pos+neg:3d} slices ({pos:2d} Pos, {neg:3d} Neg) | Dice: {dice:.4f}")
-            if args.preview and selected_slices:
+            if args.preview and preview_data:
                 preview_png = f"preprocess_preview_{pid}.png"
-                save_verification_preview_4col(selected_slices, orig_con, res_con, spatial_meta, pid, preview_png)
+                save_verification_preview_4col(
+                    preview_data['selected_slices'],
+                    preview_data['orig_consensus'],
+                    preview_data['resamp_consensus'],
+                    preview_data['spatial_meta'],
+                    pid,
+                    preview_png
+                )
         else:
             print(f"FAILED {pid}: {err}")
             failed_patients += 1
@@ -944,7 +965,7 @@ def main():
             future_to_pid = {executor.submit(process_patient_wrapper, t): t[0] for t in tasks}
 
             for future in as_completed(future_to_pid):
-                pid = future_to_pid[future]
+                pid = future_to_pid.pop(future)
                 processed_count += 1
                 elapsed = time.time() - start_time
                 pct = (processed_count / total_tasks) * 100
@@ -955,7 +976,7 @@ def main():
                 split = patient_splits.get(pid, 'N/A')
 
                 try:
-                    success, pid, entries, selected_slices, orig_con, res_con, spatial_meta, audit_record, summary_info, err = future.result()
+                    success, pid, entries, audit_record, summary_info, preview_data, err = future.result()
                     if success:
                         all_manifest_entries.extend(entries)
                         if audit_record:
@@ -970,15 +991,25 @@ def main():
                             f"{pid:<15s} [{split:<5s}] -> Saved {pos+neg:3d} slices ({pos:2d} Pos, {neg:3d} Neg) | Recon Dice: {dice:.4f}"
                         )
 
-                        if args.preview and selected_slices and successful_patients == 1:
+                        if args.preview and preview_data and successful_patients == 1:
                             preview_png = f"preprocess_preview_{pid}.png"
-                            save_verification_preview_4col(selected_slices, orig_con, res_con, spatial_meta, pid, preview_png)
+                            save_verification_preview_4col(
+                                preview_data['selected_slices'],
+                                preview_data['orig_consensus'],
+                                preview_data['resamp_consensus'],
+                                preview_data['spatial_meta'],
+                                pid,
+                                preview_png
+                            )
                     else:
                         print(f"[{processed_count:4d}/{total_tasks:4d} | {pct:5.1f}% | {time_str}] {pid:<15s} [{split:<5s}] -> FAILED: {err}")
                         failed_patients += 1
                 except Exception as exc:
                     print(f"[{processed_count:4d}/{total_tasks:4d} | {pct:5.1f}% | {time_str}] {pid:<15s} [{split:<5s}] -> EXCEPTION: {exc}")
                     failed_patients += 1
+
+                if processed_count % 50 == 0:
+                    gc.collect()
 
     if all_audit_entries:
         df_audit = pd.DataFrame(all_audit_entries)
