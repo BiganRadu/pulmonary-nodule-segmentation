@@ -243,7 +243,7 @@ def plot_training_history(history, save_path="models/unet_2.5d/training_history_
     """
     Plots training loss and validation metrics across 4 separate organized subplots:
     1. Training Loss
-    2. Overlap & Composite Score (2D PosDice, 2D AllDice, 3D Dice, IoU, Composite Score)
+    2. Overlap & Composite Score (2D Dice, 3D Volumetric Dice, IoU, Composite Score)
     3. Detection & Classification Rates (Precision, Sensitivity, Specificity)
     4. Boundary Errors (HD95 & ASD in mm)
     """
@@ -264,10 +264,8 @@ def plot_training_history(history, save_path="models/unet_2.5d/training_history_
 
     # 2. Overlap & Composite Score
     ax2 = axes[0, 1]
-    if 'val_pos_dice' in history:
-        ax2.plot(epochs, history['val_pos_dice'], label='2D Pos Dice (Tumor Only)', color='darkorange', linewidth=2)
-    if 'val_all_dice' in history:
-        ax2.plot(epochs, history['val_all_dice'], label='2D All Dice (All Slices)', color='deepskyblue', linestyle='--', linewidth=1.5)
+    if 'val_dice' in history:
+        ax2.plot(epochs, history['val_dice'], label='2D Tumor Dice', color='darkorange', linewidth=2)
     if 'val_iou' in history:
         ax2.plot(epochs, history['val_iou'], label='2D IoU', color='purple', linestyle='--', linewidth=1.5)
     if 'val_3d_dice' in history:
@@ -351,16 +349,15 @@ def train_epoch(model, loader, optimizer, loss_fn, device, epoch, total_epochs, 
 
 def validate_epoch(model, loader, device, use_amp=True, val_min_size=0):
     """
-    Evaluates MONAI UNet on validation set with per-sample metrics:
-    - 2D PosDice (Tumor Slices), 2D AllDice (All Slices), IoU, Precision, Sensitivity, Specificity, HD95, ASD, Failure Rate, 3D Volumetric Dice.
+    Evaluates MONAI UNet on validation set with macro-aggregated per-sample metrics:
+    - Dice (Tumor Slices), IoU, Precision, Sensitivity, Specificity, HD95, ASD, Failure Rate, 3D Volumetric Dice.
     """
     model.eval()
 
     patient_3d_preds = {}
     patient_3d_gts = {}
 
-    sample_all_dices = []
-    sample_pos_dices = []
+    sample_dices = []
     sample_ious = []
     sample_precisions = []
     sample_sensitivities = []
@@ -404,20 +401,6 @@ def validate_epoch(model, loader, device, use_amp=True, val_min_size=0):
                 patient_3d_gts[pid][s_idx] = g_mask
 
                 g_sum = np.sum(g_mask)
-                p_sum = np.sum(p_mask)
-
-                # 2D All Slices Dice computation
-                if g_sum == 0 and p_sum == 0:
-                    slice_all_dice = 1.0
-                elif g_sum == 0 and p_sum > 0:
-                    slice_all_dice = 0.0
-                else:
-                    tp_a = np.sum(p_mask * g_mask)
-                    fp_a = np.sum(p_mask * (1.0 - g_mask))
-                    fn_a = np.sum((1.0 - p_mask) * g_mask)
-                    slice_all_dice = float((2.0 * tp_a) / (2.0 * tp_a + fp_a + fn_a + 1e-8))
-
-                sample_all_dices.append(slice_all_dice)
 
                 if g_sum > 0:  # Macro-evaluation on positive tumor slices
                     total_pos_samples += 1
@@ -432,7 +415,7 @@ def validate_epoch(model, loader, device, use_amp=True, val_min_size=0):
                     sens = tp / (tp + fn + 1e-8)
                     spec = tn / (tn + fp + 1e-8)
 
-                    sample_pos_dices.append(dice)
+                    sample_dices.append(dice)
                     sample_ious.append(iou)
                     sample_precisions.append(prec)
                     sample_sensitivities.append(sens)
@@ -461,13 +444,8 @@ def validate_epoch(model, loader, device, use_amp=True, val_min_size=0):
             p_dice = (2.0 * inter) / (v_pred_sum + v_gt_sum + 1e-8)
             patient_3d_dices.append(p_dice)
 
-    pos_dice_mean = float(np.mean(sample_pos_dices)) if sample_pos_dices else 0.0
-    all_dice_mean = float(np.mean(sample_all_dices)) if sample_all_dices else 0.0
-
     metrics = {
-        "dice": pos_dice_mean,
-        "dice_pos": pos_dice_mean,
-        "dice_all": all_dice_mean,
+        "dice": float(np.mean(sample_dices)) if sample_dices else 0.0,
         "iou": float(np.mean(sample_ious)) if sample_ious else 0.0,
         "precision": float(np.mean(sample_precisions)) if sample_precisions else 0.0,
         "sensitivity": float(np.mean(sample_sensitivities)) if sample_sensitivities else 0.0,
@@ -478,8 +456,8 @@ def validate_epoch(model, loader, device, use_amp=True, val_min_size=0):
         "val_3d_dice": float(np.mean(patient_3d_dices)) if patient_3d_dices else 0.0
     }
 
-    # Combined composite validation score for robust model selection (PosDice + IoU + Sensitivity)
-    metrics["composite_score"] = (metrics["dice_pos"] + metrics["iou"] + metrics["sensitivity"]) / 3.0
+    # Combined composite validation score for robust model selection (Dice + IoU + Sensitivity)
+    metrics["composite_score"] = (metrics["dice"] + metrics["iou"] + metrics["sensitivity"]) / 3.0
 
     return metrics
 
@@ -553,7 +531,7 @@ def main():
     start_epoch = 1
     best_composite_score = 0.0
     history = {
-        "epoch": [], "train_loss": [], "val_3d_dice": [], "val_pos_dice": [], "val_all_dice": [],
+        "epoch": [], "train_loss": [], "val_3d_dice": [], "val_dice": [],
         "val_iou": [], "val_prec": [], "val_sens": [], "val_spec": [],
         "val_hd95": [], "val_asd": [], "val_fail_rate": [], "composite_score": []
     }
@@ -582,7 +560,7 @@ def main():
     if not args.resume or not os.path.exists(args.results_log):
         with open(args.results_log, "a") as f:
             f.write(f"\n--- Training Session Started: {time.strftime('%Y-%m-%d %H:%M:%S')} ---\n")
-            f.write("Epoch | Loss | PosDice | AllDice | IoU | Precision | Sensitivity | Specificity | HD95(mm) | ASD(mm) | FailRate | 3DDice | CompositeScore\n")
+            f.write("Epoch | Loss | Dice | IoU | Precision | Sensitivity | Specificity | HD95(mm) | ASD(mm) | FailRate | 3DDice | CompositeScore\n")
 
     total_start = time.time()
     for epoch in range(start_epoch, args.epochs + 1):
@@ -595,8 +573,7 @@ def main():
         history["epoch"].append(epoch)
         history["train_loss"].append(train_loss)
         history["val_3d_dice"].append(val_metrics["val_3d_dice"])
-        history["val_pos_dice"].append(val_metrics["dice_pos"])
-        history["val_all_dice"].append(val_metrics["dice_all"])
+        history["val_dice"].append(val_metrics["dice"])
         history["val_iou"].append(val_metrics["iou"])
         history["val_prec"].append(val_metrics["precision"])
         history["val_sens"].append(val_metrics["sensitivity"])
@@ -615,7 +592,7 @@ def main():
                 "epoch": epoch,
                 "model_state_dict": model.state_dict(),
                 "optimizer_state_dict": optimizer.state_dict(),
-                "val_dice": val_metrics["dice_pos"],
+                "val_dice": val_metrics["dice"],
                 "val_3d_dice": val_metrics["val_3d_dice"],
                 "val_metrics": val_metrics,
                 "model_kwargs": model_kwargs
@@ -633,12 +610,12 @@ def main():
             "model_kwargs": model_kwargs
         }
         torch.save(checkpoint_data, args.checkpoint_path)
-        plot_training_history(history, save_path="models/unet_2.5d/training_history_2.5d.png")
+        plot_training_history(history, save_path="models/unet_2.5d/training_history.png")
 
         # Format clean metric log string
         log_line = (
             f"Epoch {epoch:02d}/{args.epochs:02d} | Loss: {train_loss:.4f} | "
-            f"PosDice: {val_metrics['dice_pos']:.4f} | AllDice: {val_metrics['dice_all']:.4f} | "
+            f"Dice: {val_metrics['dice']:.4f} | "
             f"IoU: {val_metrics['iou']:.4f} | Prec: {val_metrics['precision']:.4f} | "
             f"Sens: {val_metrics['sensitivity']:.4f} | Spec: {val_metrics['specificity']:.4f} | "
             f"HD95: {val_metrics['hd95']:.2f}mm | ASD: {val_metrics['asd']:.2f}mm | "
@@ -651,9 +628,9 @@ def main():
 
         # Write log entry to results.txt file
         with open(args.results_log, "a") as f:
-            f.write(f"{epoch:02d} | {train_loss:.4f} | {val_metrics['dice_pos']:.4f} | {val_metrics['dice_all']:.4f} | {val_metrics['iou']:.4f} | {val_metrics['precision']:.4f} | {val_metrics['sensitivity']:.4f} | {val_metrics['specificity']:.4f} | {val_metrics['hd95']:.2f} | {val_metrics['asd']:.2f} | {val_metrics['failure_rate']*100:.1f}% | {val_metrics['val_3d_dice']:.4f} | {val_metrics['composite_score']:.4f}\n")
+            f.write(f"{epoch:02d} | {train_loss:.4f} | {val_metrics['dice']:.4f} | {val_metrics['iou']:.4f} | {val_metrics['precision']:.4f} | {val_metrics['sensitivity']:.4f} | {val_metrics['specificity']:.4f} | {val_metrics['hd95']:.2f} | {val_metrics['asd']:.2f} | {val_metrics['failure_rate']*100:.1f}% | {val_metrics['val_3d_dice']:.4f} | {val_metrics['composite_score']:.4f}\n")
 
-    plot_training_history(history, save_path="models/unet_2.5d/training_history_2.5d.png")
+    plot_training_history(history, save_path="models/unet_2.5d/training_history.png")
 
 if __name__ == "__main__":
     if sys.platform == "win32":
