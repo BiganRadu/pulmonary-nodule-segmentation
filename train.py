@@ -48,7 +48,7 @@ from tqdm import tqdm
 from scipy.ndimage import label, binary_erosion
 
 # Default Configuration Constants
-DEFAULT_MANIFEST = "preprocessed_data2/dataset_manifest.csv"
+DEFAULT_MANIFEST = "preprocessed_data/dataset_manifest.csv"
 DEFAULT_EPOCHS = 40
 DEFAULT_BATCH_SIZE = 64
 DEFAULT_LR = 1e-3
@@ -56,9 +56,9 @@ DEFAULT_MIN_LR = 1e-5
 DEFAULT_VAL_MIN_SIZE = 0
 DEFAULT_WEIGHT_DECAY = 1e-4
 DEFAULT_NUM_WORKERS = 8
-DEFAULT_SAVE_PATH = "models/unet/unet.pth"
-DEFAULT_CHECKPOINT_PATH = "models/unet/latest_checkpoint.pth"
-DEFAULT_RESULTS_LOG = "models/unet/train.txt"
+DEFAULT_SAVE_PATH = "models/unet_5xn/unet.pth"
+DEFAULT_CHECKPOINT_PATH = "models/unet_5xn/latest_checkpoint.pth"
+DEFAULT_RESULTS_LOG = "models/unet_5xn/train.txt"
 
 
 def remove_small_objects(binary_mask, min_size):
@@ -121,12 +121,55 @@ class LIDC2DDataset(Dataset):
     """
     Standard PyTorch 2D Dataset for preprocessed LIDC-IDRI slices.
     Loads slice npz files directly from disk on-the-fly.
+    Supports dynamic per-epoch negative slice resampling for the training split.
     """
-    def __init__(self, manifest_csv, split="train", transform=None):
+    def __init__(self, manifest_csv, split="train", transform=None, neg_ratio=5, seed=42):
         df = pd.read_csv(manifest_csv)
         df["filepath"] = df["filepath"].str.replace("\\", "/", regex=False)
-        self.data_entries = df[df["split"] == split].reset_index(drop=True)
+        self.split = split
         self.transform = transform
+        self.neg_ratio = neg_ratio
+        self.seed = seed
+        self.full_split_df = df[df["split"] == split].reset_index(drop=True)
+
+        if self.split == "train":
+            self.resample_epoch(epoch=1)
+        else:
+            self.data_entries = self.full_split_df
+
+    def resample_epoch(self, epoch=1):
+        """
+        Dynamically resamples negative background slices per patient for the current epoch,
+        retaining 100% of positive tumor slices and a fresh 1.5x subset of negative slices.
+        Seed varies deterministically with epoch for full reproducibility across runs.
+        """
+        if self.split != "train":
+            return
+
+        epoch_seed = self.seed + int(epoch)
+        rng = np.random.RandomState(epoch_seed)
+
+        patient_sampled_list = []
+        for pid, p_df in self.full_split_df.groupby("patient_id"):
+            pos_df = p_df[p_df["has_tumor"] == 1]
+            neg_df = p_df[p_df["has_tumor"] == 0]
+
+            num_pos = len(pos_df)
+            if num_pos > 0:
+                target_neg_count = int(np.ceil(self.neg_ratio * num_pos))
+            else:
+                target_neg_count = min(len(neg_df), 20)  # Baseline negative sampling for clean scans
+
+            if len(neg_df) > 0:
+                sampled_neg_indices = rng.choice(len(neg_df), size=min(len(neg_df), target_neg_count), replace=False)
+                sampled_neg_df = neg_df.iloc[sampled_neg_indices]
+            else:
+                sampled_neg_df = neg_df
+
+            combined_p_df = pd.concat([pos_df, sampled_neg_df]).sort_values("slice_idx")
+            patient_sampled_list.append(combined_p_df)
+
+        self.data_entries = pd.concat(patient_sampled_list).sort_values(by=["patient_id", "slice_idx"]).reset_index(drop=True)
 
     def __len__(self):
         return len(self.data_entries)
@@ -199,11 +242,11 @@ def get_transforms():
     return train_transforms, val_transforms
 
 
-def plot_training_history(history, save_path="training_history.png"):
+def plot_training_history(history, save_path="models/unet/training_history.png"):
     """
     Plots training loss and validation metrics across 4 separate organized subplots:
     1. Training Loss
-    2. Overlap & Composite Score (2D Dice, 3D Volumetric Dice, IoU, Composite Score)
+    2. Overlap & Composite Score (Dice, 3D Dice, IoU, Composite Score)
     3. Detection & Classification Rates (Precision, Sensitivity, Specificity)
     4. Boundary Errors (HD95 & ASD in mm)
     """
@@ -225,7 +268,7 @@ def plot_training_history(history, save_path="training_history.png"):
     # 2. Overlap & Composite Score
     ax2 = axes[0, 1]
     if 'val_dice' in history:
-        ax2.plot(epochs, history['val_dice'], label='2D Tumor Dice', color='darkorange', linewidth=2)
+        ax2.plot(epochs, history['val_dice'], label='2D Dice (Tumor Only)', color='darkorange', linewidth=2)
     if 'val_iou' in history:
         ax2.plot(epochs, history['val_iou'], label='2D IoU', color='purple', linestyle='--', linewidth=1.5)
     if 'val_3d_dice' in history:
@@ -310,7 +353,7 @@ def train_epoch(model, loader, optimizer, loss_fn, device, epoch, total_epochs, 
 def validate_epoch(model, loader, device, use_amp=True, val_min_size=0):
     """
     Evaluates MONAI UNet on validation set with macro-aggregated per-sample metrics:
-    - Dice (Tumor Slices), IoU, Precision, Sensitivity, Specificity, HD95, ASD, Failure Rate, 3D Volumetric Dice.
+    - Dice, IoU, Precision, Sensitivity (Recall), Specificity, HD95, ASD, Failure Rate, 3D Volumetric Dice.
     """
     model.eval()
 
@@ -345,29 +388,28 @@ def validate_epoch(model, loader, device, use_amp=True, val_min_size=0):
             masks_np = masks.cpu().numpy()
 
             for b in range(preds_np.shape[0]):
-                p_mask = preds_np[b, 0]
-                g_mask = masks_np[b, 0]
+                p_mask_bool = (preds_np[b, 0] > 0.5)
+                g_mask_bool = (masks_np[b, 0] > 0.5)
                 pid = pids[b]
                 s_idx = int(s_idxs[b])
 
                 if val_min_size > 0:
-                    p_mask = remove_small_objects(p_mask, min_size=val_min_size)
+                    p_mask_bool = remove_small_objects(p_mask_bool, min_size=val_min_size)
 
-                # Store for 3D patient volume reconstruction
+                # Store lightweight boolean masks for 3D patient volume reconstruction
                 if pid not in patient_3d_preds:
                     patient_3d_preds[pid] = {}
                     patient_3d_gts[pid] = {}
-                patient_3d_preds[pid][s_idx] = p_mask
-                patient_3d_gts[pid][s_idx] = g_mask
+                patient_3d_preds[pid][s_idx] = p_mask_bool
+                patient_3d_gts[pid][s_idx] = g_mask_bool
 
-                g_sum = np.sum(g_mask)
-
+                g_sum = np.sum(g_mask_bool)
                 if g_sum > 0:  # Macro-evaluation on positive tumor slices
                     total_pos_samples += 1
-                    tp = np.sum(p_mask * g_mask)
-                    fp = np.sum(p_mask * (1.0 - g_mask))
-                    fn = np.sum((1.0 - p_mask) * g_mask)
-                    tn = np.sum((1.0 - p_mask) * (1.0 - g_mask))
+                    tp = np.sum(p_mask_bool & g_mask_bool)
+                    fp = np.sum(p_mask_bool & ~g_mask_bool)
+                    fn = np.sum(~p_mask_bool & g_mask_bool)
+                    tn = np.sum(~p_mask_bool & ~g_mask_bool)
 
                     dice = (2.0 * tp) / (2.0 * tp + fp + fn + 1e-8)
                     iou = tp / (tp + fp + fn + 1e-8)
@@ -385,7 +427,7 @@ def validate_epoch(model, loader, device, use_amp=True, val_min_size=0):
                         failures += 1
 
                     # Surface distances (HD95 & ASD)
-                    hd95, asd = compute_surface_distances(p_mask > 0, g_mask > 0)
+                    hd95, asd = compute_surface_distances(p_mask_bool, g_mask_bool)
                     if not np.isnan(hd95):
                         sample_hd95s.append(hd95)
                         sample_asds.append(asd)
@@ -399,7 +441,7 @@ def validate_epoch(model, loader, device, use_amp=True, val_min_size=0):
 
         v_gt_sum = np.sum(vol_gt)
         if v_gt_sum > 0:
-            inter = np.sum(vol_pred * vol_gt)
+            inter = np.sum(vol_pred & vol_gt)
             v_pred_sum = np.sum(vol_pred)
             p_dice = (2.0 * inter) / (v_pred_sum + v_gt_sum + 1e-8)
             patient_3d_dices.append(p_dice)
@@ -418,6 +460,11 @@ def validate_epoch(model, loader, device, use_amp=True, val_min_size=0):
 
     # Combined composite validation score for robust model selection (Dice + IoU + Sensitivity)
     metrics["composite_score"] = (metrics["dice"] + metrics["iou"] + metrics["sensitivity"]) / 3.0
+
+    # Explicitly clear 3D volume dictionaries and trigger garbage collection
+    del patient_3d_preds, patient_3d_gts
+    import gc
+    gc.collect()
 
     return metrics
 
@@ -456,7 +503,7 @@ def main():
         shuffle=True,
         num_workers=args.num_workers,
         pin_memory=True if device.type == "cuda" else False,
-        persistent_workers=True if args.num_workers > 0 else False,
+        persistent_workers=False,  # MUST be False so workers refresh and fetch newly resampled slices every epoch!
         prefetch_factor=2 if args.num_workers > 0 else None,
         worker_init_fn=worker_init_fn if args.num_workers > 0 else None
     )
@@ -524,6 +571,9 @@ def main():
 
     total_start = time.time()
     for epoch in range(start_epoch, args.epochs + 1):
+        if hasattr(train_dataset, "resample_epoch"):
+            train_dataset.resample_epoch(epoch=epoch)
+
         train_loss, train_time = train_epoch(model, train_loader, optimizer, loss_fn, device, epoch, args.epochs, scaler=scaler)
         val_metrics = validate_epoch(model, val_loader, device, use_amp=True, val_min_size=args.val_min_size)
         current_lr = optimizer.param_groups[0]["lr"]
@@ -570,7 +620,7 @@ def main():
             "model_kwargs": model_kwargs
         }
         torch.save(checkpoint_data, args.checkpoint_path)
-        plot_training_history(history, save_path="models/unet/training_history.png")
+        plot_training_history(history, save_path="models/unet_5xn/training_history.png")
 
         # Format clean metric log string
         log_line = (
@@ -590,7 +640,7 @@ def main():
         with open(args.results_log, "a") as f:
             f.write(f"{epoch:02d} | {train_loss:.4f} | {val_metrics['dice']:.4f} | {val_metrics['iou']:.4f} | {val_metrics['precision']:.4f} | {val_metrics['sensitivity']:.4f} | {val_metrics['specificity']:.4f} | {val_metrics['hd95']:.2f} | {val_metrics['asd']:.2f} | {val_metrics['failure_rate']*100:.1f}% | {val_metrics['val_3d_dice']:.4f} | {val_metrics['composite_score']:.4f}\n")
 
-    plot_training_history(history, save_path="models/unet/training_history.png")
+    plot_training_history(history, save_path="models/unet_5xn/training_history.png")
 
 if __name__ == "__main__":
     if sys.platform == "win32":

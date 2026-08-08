@@ -34,7 +34,7 @@ from tqdm import tqdm
 from train import LIDC2DDataset, get_transforms
 
 # Default Configuration Constants
-DEFAULT_MANIFEST = "preprocessed_data2/dataset_manifest.csv"
+DEFAULT_MANIFEST = "preprocessed_data/dataset_manifest.csv"
 DEFAULT_MODEL_PATH = "models/unet/unet.pth"
 DEFAULT_BATCH_SIZE = 32
 DEFAULT_NUM_WORKERS = 8
@@ -289,7 +289,7 @@ def evaluate_test_set_hierarchical(model, loader, device, min_size=10):
                 if bbox is None:
                     continue
                 nodule_gt_mask = (labeled_gt[bbox] == n_idx)
-                nodule_pred_mask = vol_pred[bbox] * nodule_gt_mask
+                nodule_pred_mask = vol_pred[bbox]
 
                 vol_voxels = int(np.sum(nodule_gt_mask))
                 m_nodule = compute_single_mask_metrics(nodule_pred_mask, nodule_gt_mask)
@@ -302,10 +302,11 @@ def evaluate_test_set_hierarchical(model, loader, device, min_size=10):
                 else:
                     nodule_metrics_large.append(m_nodule)
 
-    # Export per-patient breakdown CSV
+    # Export per-patient breakdown CSV to report directory
     df_patients = pd.DataFrame(per_patient_rows)
-    df_patients.to_csv("patient_evaluation_breakdown.csv", index=False)
-    print("Saved individual per-patient breakdown to: patient_evaluation_breakdown.csv")
+    breakdown_path = "patient_evaluation_breakdown.csv"
+    df_patients.to_csv(breakdown_path, index=False)
+    print(f"Saved individual per-patient breakdown to: {breakdown_path}")
 
     # Aggregate summaries
     results = {
@@ -436,6 +437,10 @@ def print_and_format_report(results, min_size, report_path=DEFAULT_REPORT_PATH):
     report_text = "\n".join(lines)
     print(report_text)
 
+    report_dir = os.path.dirname(os.path.abspath(report_path))
+    if report_dir:
+        os.makedirs(report_dir, exist_ok=True)
+
     with open(report_path, "w") as f:
         f.write(report_text)
     print(f"Saved evaluation report to: {report_path}")
@@ -461,7 +466,7 @@ def main():
 
     checkpoint = torch.load(args.model_path, map_location=device)
     val_dice_str = f" (Val Dice: {checkpoint.get('val_dice', 0.0):.4f})" if 'val_dice' in checkpoint else ""
-    print(f"Loading MONAI 2D UNet model from {args.model_path}{val_dice_str}...")
+    print(f"Loading MONAI model from {args.model_path}{val_dice_str}...")
 
     state_dict = checkpoint["model_state_dict"]
     if "model_kwargs" in checkpoint:
@@ -478,8 +483,13 @@ def main():
             "num_res_units": 2
         }
 
-    model = UNet(**model_kwargs).to(device)
-    model.load_state_dict(state_dict)
+    # Dynamically detect UNet vs AttentionUnet architecture from checkpoint weights
+    try:
+        model = UNet(**model_kwargs).to(device)
+        model.load_state_dict(state_dict)
+    except Exception:
+        model = AttentionUnet(**model_kwargs).to(device)
+        model.load_state_dict(state_dict)
 
     _, val_transforms = get_transforms()
     test_dataset = LIDC2DDataset(args.manifest, split="test", transform=val_transforms)

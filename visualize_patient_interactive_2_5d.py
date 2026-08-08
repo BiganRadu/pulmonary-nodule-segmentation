@@ -16,6 +16,12 @@ if sys.platform == "win32":
             except Exception:
                 pass
 
+# PyTorch & MONAI
+import torch
+import torch.nn.functional as F
+import monai
+from monai.networks.nets import UNet, AttentionUnet
+
 # 3rd party
 import numpy as np
 import pandas as pd
@@ -23,16 +29,10 @@ import matplotlib.pyplot as plt
 from matplotlib.widgets import Button
 from scipy.ndimage import label
 
-# PyTorch & MONAI
-import torch
-import torch.nn.functional as F
-import monai
-from monai.networks.nets import UNet, AttentionUnet
-
 # Default Configuration Constants
 DEFAULT_PATIENT_ID = "LIDC-IDRI-0035"
-DEFAULT_MANIFEST = "preprocessed_data_2.5d_sampled/dataset_manifest.csv"
-DEFAULT_MODEL_PATH = "models/unet_2.5d/unet_2.5d.pth"
+DEFAULT_MANIFEST = "preprocessed_data/dataset_manifest.csv"
+DEFAULT_MODEL_PATH = "models/attention_unet_2.5d/attention_unet_2.5d.pth"
 DEFAULT_MIN_SIZE = 10
 
 
@@ -117,10 +117,10 @@ def load_trained_model(model_path, device):
             "out_channels": 1,
             "channels": (16, 32, 64, 128, 256),
             "strides": (2, 2, 2, 2),
-            "num_res_units": 2
+            #"num_res_units": 2
         }
 
-    model = UNet(**model_kwargs).to(device)
+    model = AttentionUnet(**model_kwargs).to(device)
     model.load_state_dict(state_dict)
     model.eval()
     return model

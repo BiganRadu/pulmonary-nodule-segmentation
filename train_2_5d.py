@@ -48,8 +48,7 @@ from tqdm import tqdm
 from scipy.ndimage import label, binary_erosion
 
 # Default Configuration Constants
-DEFAULT_MANIFEST = "preprocessed_data_2.5d/dataset_manifest.csv"
-DEFAULT_MASTER_MANIFEST = "preprocessed_data/dataset_manifest.csv"
+DEFAULT_MANIFEST = "preprocessed_data/dataset_manifest.csv"
 DEFAULT_EPOCHS = 40
 DEFAULT_BATCH_SIZE = 64
 DEFAULT_LR = 1e-3
@@ -98,7 +97,6 @@ def compute_surface_distances(pred_binary, gt_binary):
     if len(pred_pts) == 0 or len(gt_pts) == 0:
         return np.nan, np.nan
 
-    # Calculate surface point distances efficiently
     d_p2g = np.min(np.linalg.norm(pred_pts[:, None, :] - gt_pts[None, :, :], axis=2), axis=1)
     d_g2p = np.min(np.linalg.norm(gt_pts[:, None, :] - pred_pts[None, :, :], axis=2), axis=1)
 
@@ -123,27 +121,64 @@ class LIDC25DDataset(Dataset):
     PyTorch 2.5D Dataset for preprocessed LIDC-IDRI continuous slices.
     Loads 3 adjacent Z-slices [z-1, z, z+1] into a 3-channel input tensor (3, H, W).
     Target mask is 1-channel center slice mask [z] (1, H, W).
+    Supports dynamic per-epoch negative slice resampling for the training split.
     """
-    def __init__(self, manifest_csv, split="train", transform=None, master_manifest_csv=DEFAULT_MASTER_MANIFEST):
+    def __init__(self, manifest_csv, split="train", transform=None, neg_ratio=1.5, seed=42):
         df = pd.read_csv(manifest_csv)
         df["filepath"] = df["filepath"].str.replace("\\", "/", regex=False)
-        self.data_entries = df[df["split"] == split].reset_index(drop=True)
+        self.split = split
         self.transform = transform
+        self.neg_ratio = neg_ratio
+        self.seed = seed
+        self.full_split_df = df[df["split"] == split].reset_index(drop=True)
 
-        if master_manifest_csv and os.path.exists(master_manifest_csv):
-            master_df = pd.read_csv(master_manifest_csv)
-            master_df["filepath"] = master_df["filepath"].str.replace("\\", "/", regex=False)
-        else:
-            master_df = df
-
-        # Build fast lookup map per patient: patient_id -> {slice_idx: filepath, max_idx: int}
+        # Build fast lookup map per patient across ALL slices for 3-slice context clamping
         self.patient_slices = {}
-        for pid, group in master_df.groupby("patient_id"):
+        for pid, group in df.groupby("patient_id"):
             sorted_group = group.sort_values("slice_idx")
             self.patient_slices[pid] = {
                 "max_idx": sorted_group["slice_idx"].max(),
                 "slice_map": dict(zip(sorted_group["slice_idx"], sorted_group["filepath"]))
             }
+
+        if self.split == "train":
+            self.resample_epoch(epoch=1)
+        else:
+            self.data_entries = self.full_split_df
+
+    def resample_epoch(self, epoch=1):
+        """
+        Dynamically resamples negative background center slices per patient for the current epoch,
+        retaining 100% of positive tumor slices and a fresh 1.5x subset of negative slices.
+        Seed varies deterministically with epoch for full reproducibility across runs.
+        """
+        if self.split != "train":
+            return
+
+        epoch_seed = self.seed + int(epoch)
+        rng = np.random.RandomState(epoch_seed)
+
+        patient_sampled_list = []
+        for pid, p_df in self.full_split_df.groupby("patient_id"):
+            pos_df = p_df[p_df["has_tumor"] == 1]
+            neg_df = p_df[p_df["has_tumor"] == 0]
+
+            num_pos = len(pos_df)
+            if num_pos > 0:
+                target_neg_count = int(np.ceil(self.neg_ratio * num_pos))
+            else:
+                target_neg_count = min(len(neg_df), 20)
+
+            if len(neg_df) > 0:
+                sampled_neg_indices = rng.choice(len(neg_df), size=min(len(neg_df), target_neg_count), replace=False)
+                sampled_neg_df = neg_df.iloc[sampled_neg_indices]
+            else:
+                sampled_neg_df = neg_df
+
+            combined_p_df = pd.concat([pos_df, sampled_neg_df]).sort_values("slice_idx")
+            patient_sampled_list.append(combined_p_df)
+
+        self.data_entries = pd.concat(patient_sampled_list).sort_values(by=["patient_id", "slice_idx"]).reset_index(drop=True)
 
     def __len__(self):
         return len(self.data_entries)
@@ -174,13 +209,14 @@ class LIDC25DDataset(Dataset):
         with np.load(path_next) as npz_next:
             img_next = npz_next["image"].astype(np.float32)
 
-        # Stack into 3-channel input tensor: shape (3, H, W)
-        image_3ch = np.concatenate([img_prev, img_curr, img_next], axis=0)
+        # Stack 3 1-channel arrays along channel dimension: shape (3, H, W)
+        image_2_5d = np.concatenate([img_prev, img_curr, img_next], axis=0)
 
-        image_tensor = torch.from_numpy(image_3ch)
+        image_tensor = torch.from_numpy(image_2_5d)
         mask_tensor = torch.from_numpy(mask)
 
         sample = {"image": image_tensor, "mask": mask_tensor}
+
         if self.transform:
             sample = self.transform(sample)
 
@@ -189,8 +225,7 @@ class LIDC25DDataset(Dataset):
 
 def get_transforms():
     """
-    Returns MONAI transform pipelines with spatial resizing (256x256) and data augmentations.
-    Spatial transforms apply identically across all 3 input channels simultaneously.
+    Returns MONAI transform pipelines with spatial resizing (256x256) and data augmentations for 2.5D inputs.
     """
     train_transforms = Compose([
         Resized(
@@ -201,7 +236,7 @@ def get_transforms():
         RandRotated(
             keys=["image", "mask"],
             range_x=0.26,                  # ±15 degrees random rotation
-            mode=["bilinear", "nearest"],  # Bilinear for image, exact nearest for mask
+            mode=["bilinear", "nearest"],
             prob=0.5
         ),
         RandFlipd(
@@ -239,13 +274,9 @@ def get_transforms():
     return train_transforms, val_transforms
 
 
-def plot_training_history(history, save_path="models/unet_2.5d/training_history_2.5d.png"):
+def plot_training_history(history, save_path="models/unet_2.5d/training_history.png"):
     """
-    Plots training loss and validation metrics across 4 separate organized subplots:
-    1. Training Loss
-    2. Overlap & Composite Score (2D Dice, 3D Volumetric Dice, IoU, Composite Score)
-    3. Detection & Classification Rates (Precision, Sensitivity, Specificity)
-    4. Boundary Errors (HD95 & ASD in mm)
+    Plots training loss and validation metrics across 4 separate subplots.
     """
     epochs = history.get('epoch', [])
     if not epochs:
@@ -265,7 +296,7 @@ def plot_training_history(history, save_path="models/unet_2.5d/training_history_
     # 2. Overlap & Composite Score
     ax2 = axes[0, 1]
     if 'val_dice' in history:
-        ax2.plot(epochs, history['val_dice'], label='2D Tumor Dice', color='darkorange', linewidth=2)
+        ax2.plot(epochs, history['val_dice'], label='2D Dice (Tumor Only)', color='darkorange', linewidth=2)
     if 'val_iou' in history:
         ax2.plot(epochs, history['val_iou'], label='2D IoU', color='purple', linestyle='--', linewidth=1.5)
     if 'val_3d_dice' in history:
@@ -278,7 +309,7 @@ def plot_training_history(history, save_path="models/unet_2.5d/training_history_
     ax2.grid(True, linestyle='--', alpha=0.5)
     ax2.legend()
 
-    # 3. Detection & Classification Rates
+    # 3. Detection Rates
     ax3 = axes[1, 0]
     if 'val_prec' in history:
         ax3.plot(epochs, history['val_prec'], label='Precision', color='teal', linewidth=2)
@@ -311,13 +342,13 @@ def plot_training_history(history, save_path="models/unet_2.5d/training_history_
 
 def train_epoch(model, loader, optimizer, loss_fn, device, epoch, total_epochs, scaler=None):
     """
-    Trains MONAI UNet for 1 epoch using PyTorch AMP FP16 / FP32 precision.
+    Trains MONAI 2.5D UNet for 1 epoch using PyTorch AMP FP16 / FP32 precision.
     """
     model.train()
     running_loss = 0.0
     start_time = time.time()
 
-    pbar = tqdm(loader, desc=f"Epoch {epoch:02d}/{total_epochs:02d} [Train]", leave=False, dynamic_ncols=True)
+    pbar = tqdm(loader, desc=f"Epoch {epoch:02d}/{total_epochs:02d} [Train 2.5D]", leave=False, dynamic_ncols=True)
     for batch_idx, batch in enumerate(pbar, 1):
         images, masks = batch[0], batch[1]
         images = images.to(device, non_blocking=True)
@@ -349,8 +380,7 @@ def train_epoch(model, loader, optimizer, loss_fn, device, epoch, total_epochs, 
 
 def validate_epoch(model, loader, device, use_amp=True, val_min_size=0):
     """
-    Evaluates MONAI UNet on validation set with macro-aggregated per-sample metrics:
-    - Dice (Tumor Slices), IoU, Precision, Sensitivity, Specificity, HD95, ASD, Failure Rate, 3D Volumetric Dice.
+    Evaluates MONAI 2.5D UNet on validation set with macro-aggregated metrics and 3D volumetric reconstruction.
     """
     model.eval()
 
@@ -367,7 +397,7 @@ def validate_epoch(model, loader, device, use_amp=True, val_min_size=0):
     failures = 0
     total_pos_samples = 0
 
-    pbar = tqdm(loader, desc="[Val]", leave=False, dynamic_ncols=True)
+    pbar = tqdm(loader, desc="[Val 2.5D]", leave=False, dynamic_ncols=True)
     with torch.no_grad():
         for batch in pbar:
             images, masks, pids, s_idxs = batch[0], batch[1], batch[2], batch[3]
@@ -385,29 +415,28 @@ def validate_epoch(model, loader, device, use_amp=True, val_min_size=0):
             masks_np = masks.cpu().numpy()
 
             for b in range(preds_np.shape[0]):
-                p_mask = preds_np[b, 0]
-                g_mask = masks_np[b, 0]
+                p_mask_bool = (preds_np[b, 0] > 0.5)
+                g_mask_bool = (masks_np[b, 0] > 0.5)
                 pid = pids[b]
                 s_idx = int(s_idxs[b])
 
                 if val_min_size > 0:
-                    p_mask = remove_small_objects(p_mask, min_size=val_min_size)
+                    p_mask_bool = remove_small_objects(p_mask_bool, min_size=val_min_size)
 
-                # Store for 3D patient volume reconstruction
+                # Store lightweight boolean masks for 3D patient volume reconstruction
                 if pid not in patient_3d_preds:
                     patient_3d_preds[pid] = {}
                     patient_3d_gts[pid] = {}
-                patient_3d_preds[pid][s_idx] = p_mask
-                patient_3d_gts[pid][s_idx] = g_mask
+                patient_3d_preds[pid][s_idx] = p_mask_bool
+                patient_3d_gts[pid][s_idx] = g_mask_bool
 
-                g_sum = np.sum(g_mask)
-
+                g_sum = np.sum(g_mask_bool)
                 if g_sum > 0:  # Macro-evaluation on positive tumor slices
                     total_pos_samples += 1
-                    tp = np.sum(p_mask * g_mask)
-                    fp = np.sum(p_mask * (1.0 - g_mask))
-                    fn = np.sum((1.0 - p_mask) * g_mask)
-                    tn = np.sum((1.0 - p_mask) * (1.0 - g_mask))
+                    tp = np.sum(p_mask_bool & g_mask_bool)
+                    fp = np.sum(p_mask_bool & ~g_mask_bool)
+                    fn = np.sum(~p_mask_bool & g_mask_bool)
+                    tn = np.sum(~p_mask_bool & ~g_mask_bool)
 
                     dice = (2.0 * tp) / (2.0 * tp + fp + fn + 1e-8)
                     iou = tp / (tp + fp + fn + 1e-8)
@@ -425,7 +454,7 @@ def validate_epoch(model, loader, device, use_amp=True, val_min_size=0):
                         failures += 1
 
                     # Surface distances (HD95 & ASD)
-                    hd95, asd = compute_surface_distances(p_mask > 0, g_mask > 0)
+                    hd95, asd = compute_surface_distances(p_mask_bool, g_mask_bool)
                     if not np.isnan(hd95):
                         sample_hd95s.append(hd95)
                         sample_asds.append(asd)
@@ -439,7 +468,7 @@ def validate_epoch(model, loader, device, use_amp=True, val_min_size=0):
 
         v_gt_sum = np.sum(vol_gt)
         if v_gt_sum > 0:
-            inter = np.sum(vol_pred * vol_gt)
+            inter = np.sum(vol_pred & vol_gt)
             v_pred_sum = np.sum(vol_pred)
             p_dice = (2.0 * inter) / (v_pred_sum + v_gt_sum + 1e-8)
             patient_3d_dices.append(p_dice)
@@ -456,14 +485,18 @@ def validate_epoch(model, loader, device, use_amp=True, val_min_size=0):
         "val_3d_dice": float(np.mean(patient_3d_dices)) if patient_3d_dices else 0.0
     }
 
-    # Combined composite validation score for robust model selection (Dice + IoU + Sensitivity)
     metrics["composite_score"] = (metrics["dice"] + metrics["iou"] + metrics["sensitivity"]) / 3.0
+
+    # Explicitly clear 3D volume dictionaries and trigger garbage collection
+    del patient_3d_preds, patient_3d_gts
+    import gc
+    gc.collect()
 
     return metrics
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Train 2.5D MONAI UNet Model on LIDC-IDRI Dataset")
+    parser = argparse.ArgumentParser(description="Train MONAI 2.5D UNet Model on LIDC-IDRI Dataset")
     parser.add_argument("--manifest", type=str, default=DEFAULT_MANIFEST, help=f"Path to master manifest CSV (default: {DEFAULT_MANIFEST})")
     parser.add_argument("--epochs", type=int, default=DEFAULT_EPOCHS, help=f"Total target training epochs (default: {DEFAULT_EPOCHS})")
     parser.add_argument("--batch_size", type=int, default=DEFAULT_BATCH_SIZE, help=f"Batch size for training (default: {DEFAULT_BATCH_SIZE})")
@@ -496,7 +529,7 @@ def main():
         shuffle=True,
         num_workers=args.num_workers,
         pin_memory=True if device.type == "cuda" else False,
-        persistent_workers=True if args.num_workers > 0 else False,
+        persistent_workers=False,  # MUST be False so workers refresh and fetch newly resampled slices every epoch!
         prefetch_factor=2 if args.num_workers > 0 else None,
         worker_init_fn=worker_init_fn if args.num_workers > 0 else None
     )
@@ -515,7 +548,7 @@ def main():
     unet_channels = (16, 32, 64, 128, 256)
     model_kwargs = {
         "spatial_dims": 2,
-        "in_channels": 3,
+        "in_channels": 3,  # 2.5D 3-channel input [z-1, z, z+1]
         "out_channels": 1,
         "channels": unet_channels,
         "strides": (2, 2, 2, 2),
@@ -564,6 +597,9 @@ def main():
 
     total_start = time.time()
     for epoch in range(start_epoch, args.epochs + 1):
+        if hasattr(train_dataset, "resample_epoch"):
+            train_dataset.resample_epoch(epoch=epoch)
+
         train_loss, train_time = train_epoch(model, train_loader, optimizer, loss_fn, device, epoch, args.epochs, scaler=scaler)
         val_metrics = validate_epoch(model, val_loader, device, use_amp=True, val_min_size=args.val_min_size)
         current_lr = optimizer.param_groups[0]["lr"]

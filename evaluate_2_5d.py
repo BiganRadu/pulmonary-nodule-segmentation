@@ -34,12 +34,12 @@ from tqdm import tqdm
 from train_2_5d import LIDC25DDataset, get_transforms
 
 # Default Configuration Constants
-DEFAULT_MANIFEST = "preprocessed_data_2.5d_sampled/dataset_manifest.csv"
-DEFAULT_MODEL_PATH = "models/unet_2.5d/unet_2.5d.pth"
+DEFAULT_MANIFEST = "preprocessed_data/dataset_manifest.csv"
+DEFAULT_MODEL_PATH = "models/attention_unet_2.5d/attention_unet_2.5d.pth"
 DEFAULT_BATCH_SIZE = 32
 DEFAULT_NUM_WORKERS = 8
 DEFAULT_MIN_SIZE = 10
-DEFAULT_REPORT_PATH = "models/unet_2.5d/test_evaluation_report.txt"
+DEFAULT_REPORT_PATH = "models/attention_unet_2.5d/test_evaluation_report.txt"
 
 
 def remove_small_objects(binary_mask, min_size=DEFAULT_MIN_SIZE):
@@ -169,10 +169,10 @@ def load_trained_model(model_path, device):
             "out_channels": 1,
             "channels": (16, 32, 64, 128, 256),
             "strides": (2, 2, 2, 2),
-            "num_res_units": 2
+            #"num_res_units": 2
         }
 
-    model = UNet(**model_kwargs).to(device)
+    model = AttentionUnet(**model_kwargs).to(device)
     model.load_state_dict(state_dict)
     model.eval()
     return model
@@ -287,7 +287,7 @@ def evaluate_test_set_hierarchical(model, loader, device, min_size=10):
                 if bbox is None:
                     continue
                 nodule_gt_mask = (labeled_gt[bbox] == n_idx)
-                nodule_pred_mask = vol_pred[bbox] * nodule_gt_mask
+                nodule_pred_mask = vol_pred[bbox]
 
                 vol_voxels = int(np.sum(nodule_gt_mask))
                 m_nodule = compute_single_mask_metrics(nodule_pred_mask, nodule_gt_mask)
