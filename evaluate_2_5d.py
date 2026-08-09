@@ -21,7 +21,7 @@ if sys.platform == "win32":
 import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
-from monai.networks.nets import UNet, AttentionUnet
+from monai.networks.nets import UNet, AttentionUnet, SegResNet
 
 # 3rd party
 import numpy as np
@@ -42,7 +42,7 @@ DEFAULT_MIN_SIZE = 10
 DEFAULT_REPORT_PATH = "models/attention_unet_2.5d/test_evaluation_report.txt"
 
 
-def remove_small_objects(binary_mask, min_size=DEFAULT_MIN_SIZE):
+def remove_small_objects(binary_mask, min_size):
     if min_size <= 0 or np.sum(binary_mask) == 0:
         return binary_mask
     labeled_mask, num_features = label(binary_mask)
@@ -172,13 +172,22 @@ def load_trained_model(model_path, device):
             #"num_res_units": 2
         }
 
-    model = AttentionUnet(**model_kwargs).to(device)
-    model.load_state_dict(state_dict)
+    try:
+        model = UNet(**model_kwargs).to(device)
+        model.load_state_dict(state_dict)
+    except Exception:
+        try:
+            model = AttentionUnet(**model_kwargs).to(device)
+            model.load_state_dict(state_dict)
+        except Exception:
+            model = SegResNet(**model_kwargs).to(device)
+            model.load_state_dict(state_dict)
+
     model.eval()
     return model
 
 
-def evaluate_test_set_hierarchical(model, loader, device, min_size=10):
+def evaluate_test_set_hierarchical(model, loader, device, min_size):
     model.eval()
 
     patient_3d_preds = {}
@@ -317,10 +326,10 @@ def evaluate_test_set_hierarchical(model, loader, device, min_size=10):
     return results
 
 
-def print_and_format_report(results, min_size, report_path=DEFAULT_REPORT_PATH):
+def print_and_format_report(results, min_size, report_path):
     lines = []
     lines.append("=========================================================================================================")
-    lines.append(f"                   HIERARCHICAL EVALUATION REPORT - MONAI 2.5D UNET (Filter ≥{min_size}px)")
+    lines.append(f"                   HIERARCHICAL EVALUATION REPORT (Filter ≥{min_size}px)")
     lines.append("=========================================================================================================\n")
 
     def format_row(title, m):
@@ -377,7 +386,7 @@ def print_and_format_report(results, min_size, report_path=DEFAULT_REPORT_PATH):
     print(f"Saved evaluation report to: {report_path}")
 
     if "per_patient_df" in results:
-        csv_out = os.path.join(out_dir, "patient_evaluation_breakdown_2.5d.csv")
+        csv_out = os.path.join(out_dir, "patient_evaluation_breakdown.csv")
         results["per_patient_df"].to_csv(csv_out, index=False)
         print(f"Saved individual per-patient breakdown to: {csv_out}")
 

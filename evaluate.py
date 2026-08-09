@@ -21,7 +21,7 @@ if sys.platform == "win32":
 import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
-from monai.networks.nets import UNet, AttentionUnet
+from monai.networks.nets import UNet, AttentionUnet, SegResNet
 
 # 3rd party
 import numpy as np
@@ -39,11 +39,10 @@ DEFAULT_MODEL_PATH = "models/unet/unet.pth"
 DEFAULT_BATCH_SIZE = 32
 DEFAULT_NUM_WORKERS = 8
 DEFAULT_MIN_SIZE = 10
-DEFAULT_OUTPUT_PREVIEW = "test_predictions_preview.png"
 DEFAULT_REPORT_PATH = "models/unet/test_evaluation_report.txt"
 
 
-def remove_small_objects(binary_mask, min_size=DEFAULT_MIN_SIZE):
+def remove_small_objects(binary_mask, min_size):
     """
     Removes connected components in binary_mask that have fewer than min_size pixels.
     Eliminates small false positive noise predictions.
@@ -173,7 +172,7 @@ def aggregate_metric_dict(list_of_metric_dicts):
     }
 
 
-def evaluate_test_set_hierarchical(model, loader, device, min_size=10):
+def evaluate_test_set_hierarchical(model, loader, device, min_size):
     """
     Comprehensive hierarchical evaluation:
     1. Per-Slice evaluation (All slices & Positive tumor slices)
@@ -302,11 +301,7 @@ def evaluate_test_set_hierarchical(model, loader, device, min_size=10):
                 else:
                     nodule_metrics_large.append(m_nodule)
 
-    # Export per-patient breakdown CSV to report directory
     df_patients = pd.DataFrame(per_patient_rows)
-    breakdown_path = "patient_evaluation_breakdown.csv"
-    df_patients.to_csv(breakdown_path, index=False)
-    print(f"Saved individual per-patient breakdown to: {breakdown_path}")
 
     # Aggregate summaries
     results = {
@@ -324,71 +319,13 @@ def evaluate_test_set_hierarchical(model, loader, device, min_size=10):
     return results
 
 
-def save_visual_predictions(model, test_dataset, device, output_path="test_predictions_preview.png", num_samples=6, min_size=10):
-    """
-    Saves visual side-by-side comparison PNG previews:
-    [Input CT Image] vs [Ground Truth Mask] vs [Model Prediction Overlay]
-    """
-    model.eval()
-    pos_indices = [i for i, row in test_dataset.data_entries.iterrows() if row["has_tumor"] == 1]
-
-    if not pos_indices:
-        print("No positive tumor slices found in test set for visual preview.")
-        return
-
-    sample_indices = pos_indices[:num_samples]
-    fig, axes = plt.subplots(num_samples, 3, figsize=(12, 3.8 * num_samples))
-    fig.suptitle("MONAI 2D UNet Tumor Predictions (Test Set)", fontsize=14, fontweight='bold')
-
-    with torch.no_grad():
-        for row_idx, data_idx in enumerate(sample_indices):
-            image_tensor, mask_tensor, pid, slice_idx = test_dataset[data_idx]
-            img_input = image_tensor.unsqueeze(0).to(device)
-
-            logits = model(img_input)
-            pred_mask = (torch.sigmoid(logits) > 0.5).float().squeeze().cpu().numpy()
-            if min_size > 0:
-                pred_mask = remove_small_objects(pred_mask, min_size=min_size)
-
-            img_np = image_tensor.squeeze().numpy()
-            gt_np = mask_tensor.squeeze().numpy()
-
-            ax_img = axes[row_idx, 0] if num_samples > 1 else axes[0]
-            ax_gt = axes[row_idx, 1] if num_samples > 1 else axes[1]
-            ax_pred = axes[row_idx, 2] if num_samples > 1 else axes[2]
-
-            # Column 1: CT Image
-            ax_img.imshow(img_np, cmap='gray', vmin=0.0, vmax=1.0)
-            ax_img.set_title(f"{pid} - Slice {slice_idx}\nInput CT Image", fontsize=10)
-            ax_img.axis('off')
-
-            # Column 2: Ground Truth Overlay
-            ax_gt.imshow(img_np, cmap='gray', vmin=0.0, vmax=1.0)
-            if np.sum(gt_np) > 0:
-                ax_gt.imshow(np.ma.masked_where(gt_np == 0, gt_np), cmap='spring', alpha=0.6)
-            ax_gt.set_title("Ground Truth Consensus Mask", fontsize=10, color='magenta')
-            ax_gt.axis('off')
-
-            # Column 3: Model Prediction Overlay
-            ax_pred.imshow(img_np, cmap='gray', vmin=0.0, vmax=1.0)
-            if np.sum(pred_mask) > 0:
-                ax_pred.imshow(np.ma.masked_where(pred_mask == 0, pred_mask), cmap='cool', alpha=0.6)
-            ax_pred.set_title(f"UNet Prediction (≥{min_size}px)", fontsize=10, color='cyan')
-            ax_pred.axis('off')
-
-    plt.tight_layout()
-    plt.savefig(output_path, dpi=150, bbox_inches='tight')
-    plt.close()
-    print(f"Saved visual predictions preview to: {output_path}")
-
-
-def print_and_format_report(results, min_size, report_path=DEFAULT_REPORT_PATH):
+def print_and_format_report(results, min_size, report_path):
     """
     Formats clean metric tables and saves full report to file.
     """
     lines = []
     lines.append("=========================================================================================================")
-    lines.append(f"                   HIERARCHICAL EVALUATION REPORT - MONAI 2D UNET (Filter ≥{min_size}px)")
+    lines.append(f"                   HIERARCHICAL EVALUATION REPORT (Filter ≥{min_size}px)")
     lines.append("=========================================================================================================\n")
 
     def format_row(title, m):
@@ -445,6 +382,11 @@ def print_and_format_report(results, min_size, report_path=DEFAULT_REPORT_PATH):
         f.write(report_text)
     print(f"Saved evaluation report to: {report_path}")
 
+    if "per_patient_df" in results:
+        breakdown_path = os.path.join(report_dir, "patient_evaluation_breakdown.csv")
+        results["per_patient_df"].to_csv(breakdown_path, index=False)
+        print(f"Saved individual per-patient breakdown to: {breakdown_path}")
+
 
 def main():
     parser = argparse.ArgumentParser(description="Comprehensive Hierarchical Evaluation of MONAI 2D UNet")
@@ -453,7 +395,6 @@ def main():
     parser.add_argument("--batch_size", type=int, default=DEFAULT_BATCH_SIZE, help=f"Batch size for evaluation (default: {DEFAULT_BATCH_SIZE})")
     parser.add_argument("--num_workers", type=int, default=DEFAULT_NUM_WORKERS, help=f"DataLoader num_workers (default: {DEFAULT_NUM_WORKERS})")
     parser.add_argument("--min_size", type=int, default=DEFAULT_MIN_SIZE, help=f"Minimum connected component size (in pixels) to keep (default: {DEFAULT_MIN_SIZE})")
-    parser.add_argument("--output_preview", type=str, default=DEFAULT_OUTPUT_PREVIEW, help=f"Path for prediction PNG (default: {DEFAULT_OUTPUT_PREVIEW})")
     parser.add_argument("--report_path", type=str, default=DEFAULT_REPORT_PATH, help=f"Path for evaluation text report (default: {DEFAULT_REPORT_PATH})")
 
     args = parser.parse_args()
@@ -483,13 +424,17 @@ def main():
             "num_res_units": 2
         }
 
-    # Dynamically detect UNet vs AttentionUnet architecture from checkpoint weights
+    # Dynamically detect UNet vs AttentionUnet vs SegResNet architecture from checkpoint weights
     try:
         model = UNet(**model_kwargs).to(device)
         model.load_state_dict(state_dict)
     except Exception:
-        model = AttentionUnet(**model_kwargs).to(device)
-        model.load_state_dict(state_dict)
+        try:
+            model = AttentionUnet(**model_kwargs).to(device)
+            model.load_state_dict(state_dict)
+        except Exception:
+            model = SegResNet(**model_kwargs).to(device)
+            model.load_state_dict(state_dict)
 
     _, val_transforms = get_transforms()
     test_dataset = LIDC2DDataset(args.manifest, split="test", transform=val_transforms)
@@ -505,7 +450,6 @@ def main():
 
     results = evaluate_test_set_hierarchical(model, test_loader, device, min_size=args.min_size)
     print_and_format_report(results, args.min_size, report_path=args.report_path)
-    save_visual_predictions(model, test_dataset, device, output_path=args.output_preview, min_size=args.min_size)
 
 if __name__ == "__main__":
     if sys.platform == "win32":

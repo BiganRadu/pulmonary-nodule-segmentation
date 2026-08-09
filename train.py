@@ -27,9 +27,8 @@ import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
 
 import monai
-from monai.networks.nets import UNet
-from monai.networks.nets import AttentionUnet
-from monai.losses import DiceFocalLoss
+from monai.networks.nets import UNet, AttentionUnet, SegResNet
+from monai.losses import DiceFocalLoss, DiceCELoss, TverskyLoss
 from monai.transforms import (
     Compose,
     Resized,
@@ -56,9 +55,67 @@ DEFAULT_MIN_LR = 1e-5
 DEFAULT_VAL_MIN_SIZE = 0
 DEFAULT_WEIGHT_DECAY = 1e-4
 DEFAULT_NUM_WORKERS = 8
-DEFAULT_SAVE_PATH = "models/unet_5xn/unet.pth"
-DEFAULT_CHECKPOINT_PATH = "models/unet_5xn/latest_checkpoint.pth"
-DEFAULT_RESULTS_LOG = "models/unet_5xn/train.txt"
+DEFAULT_NEG_RATIO = 1.5
+DEFAULT_LOSS = "dice_focal"
+DEFAULT_MODEL_TYPE = "unet"
+DEFAULT_SAVE_PATH = "models/unet/unet.pth"
+
+
+def get_loss_function(loss_name):
+    """
+    Returns configured MONAI loss function instance based on loss_name.
+    Supported: 'dice_focal', 'dice_ce', 'tversky'
+    """
+    name = loss_name.lower().replace("-", "_")
+    if name in ["dice_ce", "dicece"]:
+        return DiceCELoss(sigmoid=True, squared_pred=True)
+    elif name in ["tversky"]:
+        return TverskyLoss(sigmoid=True, alpha=0.7, beta=0.3)
+    elif name in ["dice_focal", "dicefocal"]:
+        return DiceFocalLoss(sigmoid=True, squared_pred=True, gamma=2.0)
+    else:
+        raise ValueError(f"Unsupported loss function: '{loss_name}'. Choose from ['dice_focal', 'dice_ce', 'tversky']")
+
+
+def get_model(model_type, in_channels=1):
+    """
+    Instantiates and returns (model, model_kwargs) based on model_type.
+    Supported model types: 'unet', 'attention_unet', 'segresnet'
+    """
+    m_type = model_type.lower().replace("-", "_")
+    if m_type in ["unet"]:
+        model_kwargs = {
+            "spatial_dims": 2,
+            "in_channels": in_channels,
+            "out_channels": 1,
+            "channels": (16, 32, 64, 128, 256),
+            "strides": (2, 2, 2, 2),
+            "num_res_units": 2
+        }
+        model = UNet(**model_kwargs)
+    elif m_type in ["attention_unet", "attentionunet", "att_unet", "attunet"]:
+        model_kwargs = {
+            "spatial_dims": 2,
+            "in_channels": in_channels,
+            "out_channels": 1,
+            "channels": (16, 32, 64, 128, 256),
+            "strides": (2, 2, 2, 2)
+        }
+        model = AttentionUnet(**model_kwargs)
+    elif m_type in ["segresnet", "seg_resnet"]:
+        model_kwargs = {
+            "spatial_dims": 2,
+            "in_channels": in_channels,
+            "out_channels": 1,
+            "init_filters": 16,
+            "blocks_down": (1, 2, 2, 4),
+            "blocks_up": (1, 1, 1)
+        }
+        model = SegResNet(**model_kwargs)
+    else:
+        raise ValueError(f"Unsupported model type: '{model_type}'. Choose from ['unet', 'attention_unet', 'segresnet']")
+
+    return model, model_kwargs
 
 
 def remove_small_objects(binary_mask, min_size):
@@ -191,44 +248,55 @@ class LIDC2DDataset(Dataset):
         return sample["image"], sample["mask"], pid, slice_idx
 
 
-def get_transforms():
+def get_transforms(no_augmentations):
     """
     Returns MONAI transform pipelines with spatial resizing (256x256) and data augmentations.
+    If no_augmentations is True, train split uses deterministic resizing without random augmentations.
     """
-    train_transforms = Compose([
-        Resized(
-            keys=["image", "mask"],
-            spatial_size=(256, 256),
-            mode=["bilinear", "nearest"]
-        ),
-        RandRotated(
-            keys=["image", "mask"],
-            range_x=0.26,                  # ±15 degrees random rotation
-            mode=["bilinear", "nearest"],  # Bilinear for image, exact nearest for mask
-            prob=0.5
-        ),
-        RandFlipd(
-            keys=["image", "mask"],
-            spatial_axis=0,                # Horizontal flip
-            prob=0.5
-        ),
-        RandFlipd(
-            keys=["image", "mask"],
-            spatial_axis=1,                # Vertical flip
-            prob=0.5
-        ),
-        RandGaussianNoised(
-            keys=["image"],
-            prob=0.2,
-            std=0.03
-        ),
-        RandAdjustContrastd(
-            keys=["image"],
-            prob=0.3,
-            gamma=(0.8, 1.2)
-        ),
-        EnsureTyped(keys=["image", "mask"])
-    ])
+    if no_augmentations:
+        train_transforms = Compose([
+            Resized(
+                keys=["image", "mask"],
+                spatial_size=(256, 256),
+                mode=["bilinear", "nearest"]
+            ),
+            EnsureTyped(keys=["image", "mask"])
+        ])
+    else:
+        train_transforms = Compose([
+            Resized(
+                keys=["image", "mask"],
+                spatial_size=(256, 256),
+                mode=["bilinear", "nearest"]
+            ),
+            RandRotated(
+                keys=["image", "mask"],
+                range_x=0.26,                  # ±15 degrees random rotation
+                mode=["bilinear", "nearest"],  # Bilinear for image, exact nearest for mask
+                prob=0.5
+            ),
+            RandFlipd(
+                keys=["image", "mask"],
+                spatial_axis=0,                # Horizontal flip
+                prob=0.5
+            ),
+            RandFlipd(
+                keys=["image", "mask"],
+                spatial_axis=1,                # Vertical flip
+                prob=0.5
+            ),
+            RandGaussianNoised(
+                keys=["image"],
+                prob=0.2,
+                std=0.03
+            ),
+            RandAdjustContrastd(
+                keys=["image"],
+                prob=0.3,
+                gamma=(0.8, 1.2)
+            ),
+            EnsureTyped(keys=["image", "mask"])
+        ])
 
     val_transforms = Compose([
         Resized(
@@ -350,7 +418,7 @@ def train_epoch(model, loader, optimizer, loss_fn, device, epoch, total_epochs, 
     return epoch_loss, elapsed
 
 
-def validate_epoch(model, loader, device, use_amp=True, val_min_size=0):
+def validate_epoch(model, loader, device, val_min_size, use_amp=True):
     """
     Evaluates MONAI UNet on validation set with macro-aggregated per-sample metrics:
     - Dice, IoU, Precision, Sensitivity (Recall), Specificity, HD95, ASD, Failure Rate, 3D Volumetric Dice.
@@ -479,22 +547,40 @@ def main():
     parser.add_argument("--val_min_size", type=int, default=DEFAULT_VAL_MIN_SIZE, help=f"Minimum connected component size (in pixels) during validation (default: {DEFAULT_VAL_MIN_SIZE})")
     parser.add_argument("--weight_decay", type=float, default=DEFAULT_WEIGHT_DECAY, help=f"Weight decay for AdamW optimizer (default: {DEFAULT_WEIGHT_DECAY})")
     parser.add_argument("--num_workers", type=int, default=DEFAULT_NUM_WORKERS, help=f"DataLoader num_workers (default: {DEFAULT_NUM_WORKERS})")
-    parser.add_argument("--save_path", type=str, default=DEFAULT_SAVE_PATH, help=f"Path to save best model checkpoint (default: {DEFAULT_SAVE_PATH})")
-    parser.add_argument("--checkpoint_path", type=str, default=DEFAULT_CHECKPOINT_PATH, help=f"Path to save/load latest epoch checkpoint (default: {DEFAULT_CHECKPOINT_PATH})")
-    parser.add_argument("--results_log", type=str, default=DEFAULT_RESULTS_LOG, help=f"Path to results log text file (default: {DEFAULT_RESULTS_LOG})")
+    parser.add_argument("--neg_ratio", type=float, default=DEFAULT_NEG_RATIO, help=f"Ratio of negative slices to positive slices for dynamic epoch resampling (default: {DEFAULT_NEG_RATIO})")
+    parser.add_argument("--loss", type=str, choices=["dice_focal", "dice_ce", "tversky"], default=DEFAULT_LOSS, help=f"Loss function to optimize: dice_focal, dice_ce, or tversky (default: {DEFAULT_LOSS})")
+    parser.add_argument("--model_type", "--model", type=str, choices=["unet", "attention_unet", "segresnet"], default=DEFAULT_MODEL_TYPE, help=f"Model architecture to train: unet, attention_unet, or segresnet (default: {DEFAULT_MODEL_TYPE})")
+    parser.add_argument("--no_transforms", "--no_aug", action="store_true", help="Disable random data augmentations during training (keeps 256x256 resizing only)")
+    parser.add_argument("--save_path", "--model_path", type=str, default=DEFAULT_SAVE_PATH, help=f"Path to save best model checkpoint or output folder (default: {DEFAULT_SAVE_PATH})")
     parser.add_argument("--resume", action="store_true", help="Resume training from latest checkpoint if available")
 
     args = parser.parse_args()
 
-    os.makedirs(os.path.dirname(os.path.abspath(args.save_path)), exist_ok=True)
+    # Automatically derive default save directory based on chosen model_type if default path was used
+    if args.save_path == DEFAULT_SAVE_PATH and args.model_type != DEFAULT_MODEL_TYPE:
+        args.save_path = f"models/{args.model_type}/{args.model_type}.pth"
+
+    # Automatically derive all output artifact paths from --save_path directory
+    raw_save_path = os.path.normpath(args.save_path)
+    if raw_save_path.endswith(".pth"):
+        save_dir = os.path.dirname(raw_save_path) or "."
+        best_model_path = raw_save_path
+    else:
+        save_dir = raw_save_path
+        best_model_path = os.path.join(save_dir, f"{args.model_type}.pth")
+
+    os.makedirs(save_dir, exist_ok=True)
+    checkpoint_path = os.path.join(save_dir, "latest_checkpoint.pth")
+    results_log = os.path.join(save_dir, "train.txt")
+    history_plot_path = os.path.join(save_dir, "training_history.png")
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     if device.type == "cuda":
         torch.backends.cudnn.benchmark = True
 
-    train_transforms, val_transforms = get_transforms()
+    train_transforms, val_transforms = get_transforms(no_augmentations=args.no_transforms)
 
-    train_dataset = LIDC2DDataset(args.manifest, split="train", transform=train_transforms)
+    train_dataset = LIDC2DDataset(args.manifest, split="train", transform=train_transforms, neg_ratio=args.neg_ratio)
     val_dataset = LIDC2DDataset(args.manifest, split="val", transform=val_transforms)
 
     train_loader = DataLoader(
@@ -519,19 +605,10 @@ def main():
         worker_init_fn=worker_init_fn if args.num_workers > 0 else None
     )
 
-    unet_channels = (16, 32, 64, 128, 256)
-    model_kwargs = {
-        "spatial_dims": 2,
-        "in_channels": 1,
-        "out_channels": 1,
-        "channels": unet_channels,
-        "strides": (2, 2, 2, 2),
-        "num_res_units": 2
-    }
+    model, model_kwargs = get_model(args.model_type, in_channels=1)
+    model = model.to(device)
 
-    model = UNet(**model_kwargs).to(device)
-
-    loss_fn = DiceFocalLoss(sigmoid=True, squared_pred=True, gamma=2.0)
+    loss_fn = get_loss_function(args.loss)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay, fused=True if device.type == 'cuda' else False)
     scaler = torch.amp.GradScaler('cuda') if device.type == "cuda" else None
 
@@ -544,8 +621,8 @@ def main():
     }
 
     # Resume capability from checkpoint
-    if args.resume and os.path.exists(args.checkpoint_path):
-        checkpoint = torch.load(args.checkpoint_path, map_location=device)
+    if args.resume and os.path.exists(checkpoint_path):
+        checkpoint = torch.load(checkpoint_path, map_location=device)
         model.load_state_dict(checkpoint["model_state_dict"])
         optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
         start_epoch = checkpoint["epoch"] + 1
@@ -564,8 +641,8 @@ def main():
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs, eta_min=args.min_lr)
 
     # Initialize results log file header if starting fresh
-    if not args.resume or not os.path.exists(args.results_log):
-        with open(args.results_log, "a") as f:
+    if not args.resume or not os.path.exists(results_log):
+        with open(results_log, "a") as f:
             f.write(f"\n--- Training Session Started: {time.strftime('%Y-%m-%d %H:%M:%S')} ---\n")
             f.write("Epoch | Loss | Dice | IoU | Precision | Sensitivity | Specificity | HD95(mm) | ASD(mm) | FailRate | 3DDice | CompositeScore\n")
 
@@ -575,7 +652,7 @@ def main():
             train_dataset.resample_epoch(epoch=epoch)
 
         train_loss, train_time = train_epoch(model, train_loader, optimizer, loss_fn, device, epoch, args.epochs, scaler=scaler)
-        val_metrics = validate_epoch(model, val_loader, device, use_amp=True, val_min_size=args.val_min_size)
+        val_metrics = validate_epoch(model, val_loader, device, args.val_min_size, use_amp=True)
         current_lr = optimizer.param_groups[0]["lr"]
 
         scheduler.step()
@@ -596,8 +673,6 @@ def main():
         is_best = val_metrics["composite_score"] > best_composite_score
         if is_best:
             best_composite_score = val_metrics["composite_score"]
-            abs_save_path = os.path.abspath(args.save_path)
-            os.makedirs(os.path.dirname(abs_save_path), exist_ok=True)
             torch.save({
                 "epoch": epoch,
                 "model_state_dict": model.state_dict(),
@@ -606,7 +681,7 @@ def main():
                 "val_3d_dice": val_metrics["val_3d_dice"],
                 "val_metrics": val_metrics,
                 "model_kwargs": model_kwargs
-            }, abs_save_path)
+            }, best_model_path)
 
         # Save checkpoint after EVERY epoch
         checkpoint_data = {
@@ -619,8 +694,8 @@ def main():
             "history": history,
             "model_kwargs": model_kwargs
         }
-        torch.save(checkpoint_data, args.checkpoint_path)
-        plot_training_history(history, save_path="models/unet_5xn/training_history.png")
+        torch.save(checkpoint_data, checkpoint_path)
+        plot_training_history(history, save_path=history_plot_path)
 
         # Format clean metric log string
         log_line = (
@@ -637,10 +712,10 @@ def main():
         print(log_line, flush=True)
 
         # Write log entry to results.txt file
-        with open(args.results_log, "a") as f:
+        with open(results_log, "a") as f:
             f.write(f"{epoch:02d} | {train_loss:.4f} | {val_metrics['dice']:.4f} | {val_metrics['iou']:.4f} | {val_metrics['precision']:.4f} | {val_metrics['sensitivity']:.4f} | {val_metrics['specificity']:.4f} | {val_metrics['hd95']:.2f} | {val_metrics['asd']:.2f} | {val_metrics['failure_rate']*100:.1f}% | {val_metrics['val_3d_dice']:.4f} | {val_metrics['composite_score']:.4f}\n")
 
-    plot_training_history(history, save_path="models/unet_5xn/training_history.png")
+    plot_training_history(history, save_path=history_plot_path)
 
 if __name__ == "__main__":
     if sys.platform == "win32":
