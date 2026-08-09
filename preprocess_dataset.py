@@ -19,15 +19,15 @@ import matplotlib.pyplot as plt
 from scipy.ndimage import zoom, binary_fill_holes, label
 
 # Default Configuration Constants
-DEFAULT_DATASET_DIR = "/mnt/hdd/CS2023-2027/AIMAS/practica/datasetmare" if os.path.exists("/mnt/hdd/CS2023-2027/AIMAS/practica/datasetmare") else r"E:\CS2023-2027\AIMAS\practica\datasetmare"
-DEFAULT_OUTPUT_DIR = "preprocessed_data2"
+DEFAULT_DATASET_DIR = "/mnt/hdd/CS2023-2027/AIMAS/practica/datasetmare"
+DEFAULT_OUTPUT_DIR = "preprocessed_data"
 DEFAULT_NUM_WORKERS = 6
-DEFAULT_NEG_POS_RATIO = 1.5
-DEFAULT_MAX_NEG_SLICES = 20
 DEFAULT_CONSENSUS_RATIO = 0.5  # 50% strict majority threshold
 DEFAULT_TARGET_SPACING = (1.0, 1.0, 1.0)  # Isotropic 1.0mm x 1.0mm x 1.0mm voxel resolution
 DEFAULT_CROP_PADDING = 10
 DEFAULT_LUNG_Z_TRIM_RATIO = 0.25
+DEFAULT_MIN_HU = -1000.0
+DEFAULT_MAX_HU = 400.0
 
 
 def build_xml_index(dataset_dir):
@@ -395,10 +395,10 @@ def resample_volume_and_masks(volume, consensus_mask, session_masks, spatial_met
     return res_vol, res_con, res_ses, spatial_meta
 
 
-def apply_hu_windowing(hu_volume, min_hu=-1000.0, max_hu=400.0):
+def apply_hu_windowing(hu_volume, min_hu=DEFAULT_MIN_HU, max_hu=DEFAULT_MAX_HU):
     """
     Pipeline Step 4: Configurable HU Windowing & Normalization
-    Clips CT volume to [-1000, 400] HU lung window and normalizes to [0.0, 1.0].
+    Clips CT volume to [min_hu, max_hu] HU window and normalizes to [0.0, 1.0].
     """
     clipped = np.clip(hu_volume, min_hu, max_hu)
     normalized = (clipped - min_hu) / (max_hu - min_hu)
@@ -615,15 +615,15 @@ def process_single_patient(
     dataset_dir=DEFAULT_DATASET_DIR,
     output_dir=DEFAULT_OUTPUT_DIR,
     xml_index=None,
-    neg_pos_ratio=DEFAULT_NEG_POS_RATIO,
-    max_neg_slices=DEFAULT_MAX_NEG_SLICES,
     crop_padding=DEFAULT_CROP_PADDING,
     lung_z_trim_ratio=DEFAULT_LUNG_Z_TRIM_RATIO,
-    keep_all_slices=False,
+    min_hu=DEFAULT_MIN_HU,
+    max_hu=DEFAULT_MAX_HU,
     return_preview_data=False
 ):
     """
     Executes the Complete 9-Step Medically Correct DICOM Preprocessing Pipeline for a Single Patient.
+    Saves 100% of cropped Z-slices to disk for dynamic DataLoader resampling during training.
     """
     # Step 1: Standard Volumetric DICOM Conversion
     volume, slices_info, matched_xml, clean_id, spatial_meta = load_volumetric_dicom(patient_id, dataset_dir, xml_index)
@@ -643,7 +643,7 @@ def process_single_patient(
     v_orig_mm3, v_res_mm3, v_ratio = audit_nodule_volume(orig_consensus_mask, res_con, spatial_meta['original_spacing'], DEFAULT_TARGET_SPACING)
 
     # Step 4: Configurable HU Windowing & Normalization
-    norm_vol = apply_hu_windowing(res_vol)
+    norm_vol = apply_hu_windowing(res_vol, min_hu=min_hu, max_hu=max_hu)
 
     # Step 5: Anatomical Lung Cavity Cropping
     crop_vol, crop_con, crop_ses, spatial_meta = crop_lung_cavity(
@@ -659,6 +659,7 @@ def process_single_patient(
     num_slices = crop_vol.shape[2]
     positive_slices = []
     negative_slices = []
+    selected_slices = []
 
     for z in range(num_slices):
         slice_img = crop_vol[:, :, z]  # 2D cropped normalized CT
@@ -677,29 +678,11 @@ def process_single_patient(
             'session_slices': slice_sessions
         }
 
+        selected_slices.append(record)
         if tumor_pixels > 0:
             positive_slices.append(record)
         else:
             negative_slices.append(record)
-
-    # Sample negative slices (or keep all for val/test splits)
-    if keep_all_slices:
-        sampled_negatives = negative_slices
-    else:
-        num_pos = len(positive_slices)
-        if num_pos > 0:
-            num_neg_to_keep = min(len(negative_slices), int(num_pos * neg_pos_ratio) + 2)
-        else:
-            num_neg_to_keep = min(len(negative_slices), max_neg_slices)
-
-        if len(negative_slices) > num_neg_to_keep:
-            indices = np.linspace(0, len(negative_slices) - 1, num_neg_to_keep, dtype=int)
-            sampled_negatives = [negative_slices[i] for i in indices]
-        else:
-            sampled_negatives = negative_slices
-
-    selected_slices = positive_slices + sampled_negatives
-    selected_slices.sort(key=lambda r: r['slice_idx'])
 
     # Save to .npz files with individual radiologist session masks & spatial metadata
     patient_out_dir = os.path.join(output_dir, clean_id)
@@ -743,7 +726,7 @@ def process_single_patient(
     summary_info = {
         'num_slices': num_slices,
         'num_pos': len(positive_slices),
-        'num_neg': len(sampled_negatives),
+        'num_neg': len(negative_slices),
         'recon_dice': recon_dice
     }
 
@@ -832,8 +815,7 @@ def process_patient_wrapper(args_tuple):
     """
     Wrapper function for ProcessPoolExecutor parallel execution.
     """
-    pid, dataset_dir, output_dir, xml_index, split, crop_padding, lung_z_trim_ratio, keep_all_slices, save_preview_data = args_tuple
-    should_keep_all = keep_all_slices or (split in ['val', 'test'])
+    pid, dataset_dir, output_dir, xml_index, split, crop_padding, lung_z_trim_ratio, min_hu, max_hu, save_preview_data = args_tuple
     try:
         entries, audit_record, summary_info, preview_data = process_single_patient(
             pid,
@@ -842,7 +824,8 @@ def process_patient_wrapper(args_tuple):
             xml_index=xml_index,
             crop_padding=crop_padding,
             lung_z_trim_ratio=lung_z_trim_ratio,
-            keep_all_slices=should_keep_all,
+            min_hu=min_hu,
+            max_hu=max_hu,
             return_preview_data=save_preview_data
         )
         for entry in entries:
@@ -878,7 +861,8 @@ def main():
     parser.add_argument("--output_dir", type=str, default=DEFAULT_OUTPUT_DIR, help=f"Output directory for .npz files (default: {DEFAULT_OUTPUT_DIR})")
     parser.add_argument("--crop_padding", type=int, default=DEFAULT_CROP_PADDING, help=f"Margin padding in voxels for lung crop bounding box (default: {DEFAULT_CROP_PADDING})")
     parser.add_argument("--lung_z_trim_ratio", type=float, default=DEFAULT_LUNG_Z_TRIM_RATIO, help=f"Ratio of peak internal lung air threshold for Z-slice trimming (default: {DEFAULT_LUNG_Z_TRIM_RATIO})")
-    parser.add_argument("--keep_all_slices", action="store_true", default=False, help="Keep all cropped Z-slices without negative sampling (always active for val/test splits)")
+    parser.add_argument("--min_hu", type=float, default=DEFAULT_MIN_HU, help=f"Minimum HU value for window clipping (default: {DEFAULT_MIN_HU})")
+    parser.add_argument("--max_hu", type=float, default=DEFAULT_MAX_HU, help=f"Maximum HU value for window clipping (default: {DEFAULT_MAX_HU})")
     parser.add_argument("--preview", action="store_true", default=False, help="Save visual verification preview image")
 
     args = parser.parse_args()
@@ -902,6 +886,7 @@ def main():
     print(f"\n=========================================================================")
     print(f" Starting LIDC Preprocessing: {len(patient_dirs)} Patients | {num_workers} Parallel CPU Workers")
     print(f" Output Directory: {args.output_dir}")
+    print(f" HU Windowing: [{args.min_hu:.1f}, {args.max_hu:.1f}] HU")
     print(f"=========================================================================\n")
 
     np.random.seed(42)
@@ -922,7 +907,7 @@ def main():
             patient_splits[pid] = 'test'
 
     tasks = [
-        (pid, args.dataset_dir, args.output_dir, xml_index, patient_splits[pid], args.crop_padding, args.lung_z_trim_ratio, args.keep_all_slices, args.preview)
+        (pid, args.dataset_dir, args.output_dir, xml_index, patient_splits[pid], args.crop_padding, args.lung_z_trim_ratio, args.min_hu, args.max_hu, args.preview)
         for pid in shuffled_pids
     ]
 
