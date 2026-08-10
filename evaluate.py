@@ -26,6 +26,8 @@ from monai.networks.nets import UNet, AttentionUnet, SegResNet
 # 3rd party
 import numpy as np
 import pandas as pd
+import matplotlib
+matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 from scipy.ndimage import label, binary_erosion, find_objects
 from tqdm import tqdm

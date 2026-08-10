@@ -42,6 +42,8 @@ from monai.transforms import (
 # 3rd party
 import numpy as np
 import pandas as pd
+import matplotlib
+matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 from tqdm import tqdm
 from scipy.ndimage import label, binary_erosion
@@ -55,7 +57,7 @@ DEFAULT_MIN_LR = 1e-5
 DEFAULT_VAL_MIN_SIZE = 0
 DEFAULT_WEIGHT_DECAY = 1e-4
 DEFAULT_NUM_WORKERS = 8
-DEFAULT_NEG_RATIO = 2.5
+DEFAULT_NEG_RATIO = 1.5
 DEFAULT_LOSS = "dice_focal"
 DEFAULT_MODEL_TYPE = "unet"
 DEFAULT_SAVE_PATH = "models/unet_2.5d/unet_2.5d.pth"
@@ -70,7 +72,7 @@ def get_loss_function(loss_name):
     if name in ["dice_ce", "dicece"]:
         return DiceCELoss(sigmoid=True, squared_pred=True)
     elif name in ["tversky"]:
-        return TverskyLoss(sigmoid=True, alpha=0.7, beta=0.3)
+        return TverskyLoss(sigmoid=True, alpha=0.7, beta=0.3, smooth_nr=1e-4, smooth_dr=1e-4)
     elif name in ["dice_focal", "dicefocal"]:
         return DiceFocalLoss(sigmoid=True, squared_pred=True, gamma=2.0)
     else:
@@ -428,13 +430,26 @@ def train_epoch(model, loader, optimizer, loss_fn, device, epoch, total_epochs, 
             with torch.amp.autocast('cuda'):
                 logits = model(images)
                 loss = loss_fn(logits, masks)
+
+            if torch.isnan(loss) or torch.isinf(loss):
+                optimizer.zero_grad()
+                continue
+
             scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             scaler.step(optimizer)
             scaler.update()
         else:
             logits = model(images)
             loss = loss_fn(logits, masks)
+
+            if torch.isnan(loss) or torch.isinf(loss):
+                optimizer.zero_grad()
+                continue
+
             loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
 
         loss_val = loss.item()
