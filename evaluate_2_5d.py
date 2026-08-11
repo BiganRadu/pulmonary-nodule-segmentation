@@ -388,7 +388,13 @@ def print_and_format_report(results, min_size, report_path):
     print(f"Saved evaluation report to: {report_path}")
 
     if "per_patient_df" in results:
-        csv_out = os.path.join(out_dir, "patient_evaluation_breakdown.csv")
+        report_filename = os.path.basename(report_path)
+        report_stem, _ = os.path.splitext(report_filename)
+        if report_stem == "test_evaluation_report":
+            csv_name = "patient_evaluation_breakdown.csv"
+        else:
+            csv_name = f"patient_breakdown_{report_stem}.csv"
+        csv_out = os.path.join(out_dir, csv_name)
         results["per_patient_df"].to_csv(csv_out, index=False)
         print(f"Saved individual per-patient breakdown to: {csv_out}")
 

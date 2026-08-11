@@ -72,7 +72,14 @@ def get_loss_function(loss_name):
     if name in ["dice_ce", "dicece"]:
         return DiceCELoss(sigmoid=True, squared_pred=True)
     elif name in ["tversky"]:
-        return TverskyLoss(sigmoid=True, alpha=0.7, beta=0.3, smooth_nr=1e-4, smooth_dr=1e-4)
+        class TverskyCELoss(torch.nn.Module):
+            def __init__(self, alpha=0.3, beta=0.7):
+                super().__init__()
+                self.tversky = TverskyLoss(sigmoid=True, alpha=alpha, beta=beta)
+                self.bce = torch.nn.BCEWithLogitsLoss()
+            def forward(self, input, target):
+                return self.tversky(input, target) + self.bce(input, target)
+        return TverskyCELoss(alpha=0.3, beta=0.7)
     elif name in ["dice_focal", "dicefocal"]:
         return DiceFocalLoss(sigmoid=True, squared_pred=True, gamma=2.0)
     else:
@@ -282,7 +289,7 @@ class LIDC25DDataset(Dataset):
         return sample["image"], sample["mask"], pid, z
 
 
-def get_transforms(no_augmentations):
+def get_transforms(no_augmentations=False):
     """
     Returns MONAI transform pipelines with spatial resizing (256x256) and data augmentations for 2.5D inputs.
     If no_augmentations is True, train split uses deterministic resizing without random augmentations.
@@ -430,26 +437,13 @@ def train_epoch(model, loader, optimizer, loss_fn, device, epoch, total_epochs, 
             with torch.amp.autocast('cuda'):
                 logits = model(images)
                 loss = loss_fn(logits, masks)
-
-            if torch.isnan(loss) or torch.isinf(loss):
-                optimizer.zero_grad()
-                continue
-
             scaler.scale(loss).backward()
-            scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             scaler.step(optimizer)
             scaler.update()
         else:
             logits = model(images)
             loss = loss_fn(logits, masks)
-
-            if torch.isnan(loss) or torch.isinf(loss):
-                optimizer.zero_grad()
-                continue
-
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
 
         loss_val = loss.item()
