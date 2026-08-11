@@ -291,9 +291,9 @@ Sweep of minimum connected component size threshold (`min_size` = 0, 5, 10, 15 p
 ## 6. Installation & Reproduction
 
 ### 6.1 Prerequisites & Dependencies
-- Linux OS (Ubuntu 20.04/22.04 recommended)
+- Linux OS / Windows
 - Python 3.12+
-- CUDA-capable GPU (NVIDIA RTX 3090/4090 or A100 recommended)
+- CUDA-capable GPU
 
 Install project requirements:
 ```bash
