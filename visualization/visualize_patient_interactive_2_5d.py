@@ -20,7 +20,7 @@ if sys.platform == "win32":
 import torch
 import torch.nn.functional as F
 import monai
-from monai.networks.nets import UNet, AttentionUnet
+from monai.networks.nets import UNet, AttentionUnet, SegResNet
 
 # 3rd party
 import numpy as np
@@ -98,30 +98,42 @@ def load_patient_slices(manifest_path, patient_id):
 
 def load_trained_model(model_path, device):
     """
-    Loads trained 2.5D MONAI UNet model checkpoint.
+    Loads trained 2.5D MONAI model checkpoint (auto-detects UNet vs AttentionUnet vs SegResNet).
     """
     if not os.path.exists(model_path):
         print(f"Error: Model file '{model_path}' not found. Train first using train_2_5d.py.")
         sys.exit(1)
 
-    print(f"Loading trained 2.5D MONAI UNet model from {model_path}...")
+    print(f"Loading trained 2.5D MONAI model from {model_path}...")
     checkpoint = torch.load(model_path, map_location=device)
     state_dict = checkpoint["model_state_dict"]
 
     if "model_kwargs" in checkpoint:
         model_kwargs = checkpoint["model_kwargs"]
     else:
+        first_layer_key = [k for k in state_dict.keys() if "weight" in k][0]
+        base = state_dict[first_layer_key].shape[0]
         model_kwargs = {
             "spatial_dims": 2,
             "in_channels": 3,
             "out_channels": 1,
-            "channels": (16, 32, 64, 128, 256),
+            "channels": tuple(base * (2**i) for i in range(5)),
             "strides": (2, 2, 2, 2),
-            #"num_res_units": 2
+            "num_res_units": 2
         }
 
-    model = AttentionUnet(**model_kwargs).to(device)
-    model.load_state_dict(state_dict)
+    # Dynamically detect UNet vs AttentionUnet vs SegResNet architecture from checkpoint weights
+    try:
+        model = UNet(**model_kwargs).to(device)
+        model.load_state_dict(state_dict)
+    except Exception:
+        try:
+            model = AttentionUnet(**model_kwargs).to(device)
+            model.load_state_dict(state_dict)
+        except Exception:
+            model = SegResNet(**model_kwargs).to(device)
+            model.load_state_dict(state_dict)
+
     model.eval()
     return model
 

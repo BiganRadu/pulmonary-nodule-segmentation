@@ -20,7 +20,7 @@ if sys.platform == "win32":
 import torch
 import torch.nn.functional as F
 import monai
-from monai.networks.nets import UNet, AttentionUnet
+from monai.networks.nets import UNet, AttentionUnet, SegResNet
 
 # 3rd party
 import numpy as np
@@ -94,13 +94,13 @@ def load_patient_slices(manifest_path, patient_id):
 
 def load_trained_model(model_path, device):
     """
-    Loads trained 2D MONAI UNet model checkpoint.
+    Loads trained 2D MONAI model checkpoint (auto-detects UNet vs AttentionUnet vs SegResNet).
     """
     if not os.path.exists(model_path):
         print(f"Error: Model file '{model_path}' not found. Train first using train.py.")
         sys.exit(1)
 
-    print(f"Loading trained MONAI UNet model from {model_path}...")
+    print(f"Loading trained MONAI model from {model_path}...")
     checkpoint = torch.load(model_path, map_location=device)
     state_dict = checkpoint["model_state_dict"]
 
@@ -118,8 +118,18 @@ def load_trained_model(model_path, device):
             "num_res_units": 2
         }
 
-    model = UNet(**model_kwargs).to(device)
-    model.load_state_dict(state_dict)
+    # Dynamically detect UNet vs AttentionUnet vs SegResNet architecture from checkpoint weights
+    try:
+        model = UNet(**model_kwargs).to(device)
+        model.load_state_dict(state_dict)
+    except Exception:
+        try:
+            model = AttentionUnet(**model_kwargs).to(device)
+            model.load_state_dict(state_dict)
+        except Exception:
+            model = SegResNet(**model_kwargs).to(device)
+            model.load_state_dict(state_dict)
+
     model.eval()
     return model
 
