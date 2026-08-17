@@ -39,7 +39,7 @@ The master manifest indexes all **240,242 resampled 2D slices** across 1,010 pat
 
 ## 2. Preprocessing Pipeline
 
-Data preparation is implemented in `preprocess_dataset.py`, parallelized across multi-core CPUs via `ProcessPoolExecutor`:
+Data preparation is implemented in `preprocess/preprocess_dataset.py`, parallelized across multi-core CPUs via `ProcessPoolExecutor`:
 
 ```
 Raw DICOM CT + XML Annotations 
@@ -69,7 +69,7 @@ Raw DICOM CT + XML Annotations
 8. Export NPZ & Manifest ──► Save Float32 NPZ slices & dataset_manifest.csv
 ```
 
-### Preprocessing Configuration Options (`preprocess_dataset.py`)
+### Preprocessing Configuration Options (`preprocess/preprocess_dataset.py`)
 - `--dataset_dir`: Path to root directory containing DICOM folders and XML annotations.
 - `--output_dir`: Target directory for saved `.npz` files and manifest files (default: `preprocessed_data`).
 - `--num_workers`: Number of parallel CPU processes (default: `6`).
@@ -80,7 +80,7 @@ Raw DICOM CT + XML Annotations
 
 ## 3. Training Pipeline
 
-Training is performed using `train.py` for 2D single-slice models and `train_2_5d.py` for 2.5D multi-slice models.
+Training is performed using `training/train.py` for 2D single-slice models and `training/train_2_5d.py` for 2.5D multi-slice models.
 
 ```
                      ┌───────────────────────────┐
@@ -146,7 +146,7 @@ Training is performed using `train.py` for 2D single-slice models and `train_2_5
 
 ## 4. Evaluation Pipeline
 
-Model evaluation is executed via `evaluate.py` (2D models) and `evaluate_2_5d.py` (2.5D models), producing text summaries and structured CSV breakdowns (`patient_evaluation_breakdown.csv`).
+Model evaluation is executed via `evaluation/evaluate.py` (2D models) and `evaluation/evaluate_2_5d.py` (2.5D models), producing text summaries and structured CSV breakdowns (`patient_evaluation_breakdown.csv`).
 
 ### 4.1 Hierarchical 4-Level Evaluation Framework
 1. **Per-Slice 2D Evaluation:** Calculates Dice, IoU, Precision, Sensitivity, Specificity, Hausdorff Distance (HD95), Average Surface Distance (ASD), and Failure Rate across tumor-positive slices.
@@ -322,7 +322,7 @@ opencv-python<5.0.0
 #### Step 1: Dataset Preprocessing
 Convert raw LIDC-IDRI DICOM files and XML annotations into isotropic `.npz` slices:
 ```bash
-python preprocess_dataset.py \
+python preprocess/preprocess_dataset.py \
     --dataset_dir /path/to/LIDC-IDRI \
     --output_dir preprocessed_data \
     --num_workers 8 \
@@ -332,7 +332,7 @@ python preprocess_dataset.py \
 #### Step 2: Model Training Examples
 Train the top-performing **Attention UNet 2.5D** model:
 ```bash
-python train_2_5d.py \
+python training/train_2_5d.py \
     --model_type attention_unet \
     --loss dice_focal \
     --epochs 40 \
@@ -343,7 +343,7 @@ python train_2_5d.py \
 
 Train a 2D baseline UNet model:
 ```bash
-python train.py \
+python training/train.py \
     --model_type unet \
     --loss dice_focal \
     --epochs 40 \
@@ -354,7 +354,7 @@ python train.py \
 #### Step 3: Single Model Evaluation
 Evaluate a trained model checkpoint on the test set:
 ```bash
-python evaluate_2_5d.py \
+python evaluation/evaluate_2_5d.py \
     --model_path models/attention_unet_2.5d/attention_unet_2.5d.pth \
     --report_path models/attention_unet_2.5d/test_evaluation_report.txt \
     --min_size 10
@@ -363,31 +363,31 @@ python evaluate_2_5d.py \
 #### Step 4: Automated Batch Evaluation of All Models
 Run test evaluation across all 8 model directories:
 ```bash
-bash evaluate_all.sh
+bash scripts/evaluate_all.sh
 ```
 
 ---
 
 ## 7. Visualization Tools
 
-### 7.1 Interactive Slice Visualizer (`visualize_patient_interactive.py`)
+### 7.1 Interactive Slice Visualizer (`visualization/visualize_patient_interactive.py`)
 An interactive Tkinter GUI application for exploring 2D model predictions slice-by-slice alongside ground-truth masks:
 ```bash
-python visualize_patient_interactive.py \
+python visualization/visualize_patient_interactive.py \
     --model_path models/attention_unet/attention_unet.pth \
     --patient_id LIDC-IDRI-0002
 ```
 
-### 7.2 Interactive 2.5D Visualizer (`visualize_patient_interactive_2_5d.py`)
+### 7.2 Interactive 2.5D Visualizer (`visualization/visualize_patient_interactive_2_5d.py`)
 Interactive slice visualizer designed specifically for 3-channel 2.5D multi-slice predictions:
 ```bash
-python visualize_patient_interactive_2_5d.py \
+python visualization/visualize_patient_interactive_2_5d.py \
     --model_path models/attention_unet_2.5d/attention_unet_2.5d.pth \
     --patient_id LIDC-IDRI-0002
 ```
 
-### 7.3 Dataset Analytics Visualizer (`visualize_dataset.py`)
+### 7.3 Dataset Analytics Visualizer (`visualization/visualize_dataset.py`)
 Generates exploratory dataset distribution plots for slice thickness, HU histograms, and nodule volume distributions:
 ```bash
-python visualize_dataset.py
+python visualization/visualize_dataset.py
 ```

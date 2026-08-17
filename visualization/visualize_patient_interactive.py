@@ -32,7 +32,7 @@ from scipy.ndimage import label
 # Default Configuration Constants
 DEFAULT_PATIENT_ID = "LIDC-IDRI-0035"
 DEFAULT_MANIFEST = "preprocessed_data/dataset_manifest.csv"
-DEFAULT_MODEL_PATH = "models/unet_5xn/unet.pth"
+DEFAULT_MODEL_PATH = "models/unet_dicefocal/unet_dicefocal.pth"
 DEFAULT_MIN_SIZE = 10
 
 def remove_small_objects(binary_mask, min_size):

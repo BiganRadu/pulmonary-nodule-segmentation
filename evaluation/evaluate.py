@@ -33,7 +33,8 @@ from scipy.ndimage import label, binary_erosion, find_objects
 from tqdm import tqdm
 
 # Local imports
-from train import LIDC2DDataset, get_transforms
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+from training.train import LIDC2DDataset, get_transforms
 
 # Default Configuration Constants
 DEFAULT_MANIFEST = "preprocessed_data/dataset_manifest.csv"
