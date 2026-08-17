@@ -655,6 +655,8 @@ def main():
         "val_hd95": [], "val_asd": [], "val_fail_rate": [], "composite_score": []
     }
 
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs, eta_min=args.min_lr)
+
     # Resume capability from checkpoint
     if args.resume and os.path.exists(checkpoint_path):
         checkpoint = torch.load(checkpoint_path, map_location=device)
@@ -667,13 +669,11 @@ def main():
         if "scaler_state_dict" in checkpoint and scaler is not None and checkpoint.get("scaler_state_dict") is not None:
             scaler.load_state_dict(checkpoint["scaler_state_dict"])
 
-        for param_group in optimizer.param_groups:
-            param_group["lr"] = args.lr
-
-        remaining_epochs = max(1, args.epochs - start_epoch + 1)
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=remaining_epochs, eta_min=args.min_lr)
-    else:
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs, eta_min=args.min_lr)
+        if "scheduler_state_dict" in checkpoint and checkpoint.get("scheduler_state_dict") is not None:
+            scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
+        else:
+            for _ in range(start_epoch - 1):
+                scheduler.step()
 
     # Initialize results log file header if starting fresh
     if not args.resume or not os.path.exists(results_log):
