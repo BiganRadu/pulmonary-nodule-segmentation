@@ -32,8 +32,12 @@ The master manifest indexes all **240,242 resampled 2D slices** across 1,010 pat
 | **Validation Split** | 23,124 slices (9.6%) |
 | **Test Split** | 23,622 slices (9.8%) |
 | **Class Distribution (Slices)** | **225,690 Negative Slices (93.94%)** vs. **14,552 Positive Slices (6.06%)** |
-| **Inter-Annotator Agreement** | Mean Dice between radiologist annotations per patient: `inter_annotator_dice` |
-| **Volume Preservation QA** | Voxel volume before/after resampling: `v_orig_mm3`, `v_resamp_mm3`, `v_retention_ratio` (~1.008), `recon_dice` (>0.975) |
+| **Inter-Annotator Agreement** | Pairwise radiologist agreement: **Mean ~0.590**, **Median ~0.642** (Std: 0.227) (`inter_annotator_dice`) |
+| **Volume Preservation QA** | Voxel volume before/after resampling: `v_orig_mm3`, `v_resamp_mm3`, `v_retention_ratio` (~0.997), `recon_dice` (~0.936) |
+
+> [!NOTE]
+> **Inter-Annotator Agreement Benchmark:**
+> Individual radiologist annotations across the LIDC-IDRI dataset show a mean pairwise inter-annotator Dice agreement of **0.5896** (median **0.6421**, std **0.2272**). Models are evaluated against the 50% majority consensus mask (which provides a smoother, more centered ground truth). The top-performing segmentation models (e.g. Attention UNet 2.5D with 0.6586 2D tumor Dice / 0.6942 3D nodule Dice) operate near the intrinsic noise ceiling of expert human variability.
 
 ---
 
@@ -112,9 +116,9 @@ Training is performed using `training/train.py` for 2D single-slice models and `
 ```
 
 ### 3.1 Supported Model Architectures
-1. **UNet (`unet`)**: MONAI UNet architecture with feature channels `(32, 64, 128, 256, 512)`, down/upsampling strides `(2, 2, 2, 2)`, and `num_res_units=2`.
-2. **Attention UNet (`attention_unet`)**: MONAI AttentionUnet integrating attention gating mechanisms at skip connections to suppress non-salient background noise.
-3. **SegResNet (`segresnet`)**: MONAI SegResNet encoder-decoder network featuring residual blocks (`init_filters=32`, `blocks_down=(1,2,2,4)`).
+1. **UNet (`unet`)**: MONAI UNet architecture with feature channels `(16, 32, 64, 128, 256)`, down/upsampling strides `(2, 2, 2, 2)`, and `num_res_units=2`.
+2. **Attention UNet (`attention_unet`)**: MONAI AttentionUnet integrating attention gating mechanisms at skip connections with feature channels `(16, 32, 64, 128, 256)` to suppress non-salient background noise.
+3. **SegResNet (`segresnet`)**: MONAI SegResNet encoder-decoder network featuring residual blocks (`init_filters=16`, `blocks_down=(1,2,2,4)`).
 
 ### 3.2 Loss Function Formulations
 - **`dice_focal`** (Default): `DiceFocalLoss(sigmoid=True, squared_pred=True, gamma=2.0)`. Blends Dice overlap optimization with Focal Loss to focus gradients on hard-to-classify boundary pixels.
@@ -170,7 +174,7 @@ Model evaluation is executed via `evaluation/evaluate.py` (2D models) and `evalu
 
 ## 5. Experimental Results & Architecture Comparisons
 
-We benchmarked **8 model configurations** across 40 epochs. All experiments were conducted on the official LIDC-IDRI test split (23,622 2D slices across 101 test CT scans).
+We benchmarked **8 model configurations** across 40 epochs. All evaluation experiments were conducted on the patient-level, reproducibly seeded test split (23,622 2D slices across 101 test CT scans; 80/10/10 split with `seed=42`).
 
 ### 5.1 Training Convergence Summary (Peak Validation Metrics at Best Checkpoint)
 
@@ -178,14 +182,14 @@ During training, model checkpoints (`.pth`) are automatically saved whenever a r
 
 | Model Architecture | Input Dim | Loss Function | Peak Epoch | Val Dice | Val IoU | Precision | Sensitivity | Specificity | HD95 (mm) | ASD (mm) | Fail Rate | Composite Score |
 |---|---|---|---|---|---|---|---|---|---|---|---|---|
-| **SegResNet 2.5D** | 2.5D | DiceFocal | Ep 32 | **0.7180** | **0.6072** | 0.7140 | **0.7727** | 0.9999 | **17.53** | **8.54** | **7.2%** | **0.6993** |
-| **Attention UNet 2.5D** | 2.5D | DiceFocal | Ep 20 | **0.7115** | 0.6027 | 0.7094 | 0.7679 | 0.9999 | 19.34 | 9.72 | 7.8% | 0.6940 |
+| **SegResNet 2.5D** | 2.5D | DiceFocal | Ep 32 | **0.7180** | **0.6072** | **0.7140** | **0.7727** | 0.9999 | **17.53** | **8.54** | **7.2%** | **0.6993** |
+| **Attention UNet 2.5D** | 2.5D | DiceFocal | Ep 20 | 0.7115 | 0.6027 | 0.7094 | 0.7679 | 0.9999 | 19.34 | 9.72 | 7.8% | 0.6940 |
 | **SegResNet 2D** | 2D | DiceFocal | Ep 33 | 0.6697 | 0.5720 | 0.6742 | 0.7108 | 0.9998 | 25.87 | 14.79 | 14.3% | 0.6508 |
 | **Attention UNet 2D** | 2D | DiceFocal | Ep 23 | 0.6565 | 0.5562 | 0.6657 | 0.6939 | 0.9999 | 26.79 | 14.01 | 14.5% | 0.6356 |
 | **UNet 2.5D** | 2.5D | DiceFocal | Ep 23 | 0.6438 | 0.5339 | 0.6383 | 0.7175 | 0.9998 | 24.83 | 12.07 | 12.1% | 0.6317 |
 | **UNet 2D (DiceFocal)** | 2D | DiceFocal | Ep 34 | 0.5940 | 0.4960 | 0.6123 | 0.6250 | 0.9998 | 34.45 | 19.66 | 20.3% | 0.5716 |
 | **UNet 2D (DiceCE)** | 2D | DiceCE | Ep 24 | 0.5659 | 0.4680 | 0.5625 | 0.6223 | 0.9998 | 37.29 | 21.87 | 22.5% | 0.5520 |
-| **UNet 2D (No Aug)** | 2D | DiceFocal | Ep 06 | 0.3381 | 0.2503 | 0.2937 | 0.5211 | 1.0000 | 76.42 | 38.03 | 39.0% | 0.3698 |
+| **UNet 2D (No Aug)** | 2D | DiceFocal | Ep 06 | 0.3381 | 0.2503 | 0.2937 | 0.5211 | **1.0000** | 76.42 | 38.03 | 39.0% | 0.3698 |
 
 ![Validation Dice Comparison](charts/validation_dice_comparison.png)
 
@@ -197,16 +201,16 @@ During training, model checkpoints (`.pth`) are automatically saved whenever a r
 
 Evaluating the saved best model checkpoints on the held-out **Test Set** (23,622 total test slices: 1,395 tumor-positive slices, 22,227 background slices, 186 distinct 3D nodules). Predictions are post-processed with connected component noise filtering (`--min_size 10` pixels):
 
-| Model Architecture | Input Dim | 2D All Slices Dice | 2D Tumor Slice Dice | 2D Tumor Slice IoU | Precision | Sensitivity | HD95 (mm) | ASD (mm) | 2D Fail Rate | 3D Nodule Lesion Dice |
+| Model Architecture | Input Dim | 2D Tumor Slice Dice | 2D Tumor Slice IoU | Precision | Sensitivity | HD95 (mm) | ASD (mm) | 2D Fail Rate | 2D All Slices Dice | 3D Nodule Lesion Dice |
 |---|---|---|---|---|---|---|---|---|---|---|
-| **Attention UNet 2.5D** | 2.5D | 0.4525 | **0.6586** | **0.5552** | **0.6775** | **0.6946** | 12.34 | 7.83 | **14.6%** | **0.6942** |
-| **SegResNet 2.5D** | 2.5D | 0.3848 | 0.6655 | 0.5627 | 0.6784 | 0.6977 | **11.08** | **7.30** | 14.7% | 0.6764 |
-| **SegResNet 2D** | 2D | 0.4908 | 0.6390 | 0.5425 | 0.6634 | 0.6579 | 13.27 | 9.12 | 18.5% | 0.6725 |
-| **Attention UNet 2D** | 2D | 0.4354 | 0.6218 | 0.5243 | 0.6452 | 0.6432 | 15.50 | 9.69 | 19.1% | 0.6630 |
-| **UNet 2.5D** | 2.5D | **0.5156** | 0.6224 | 0.5171 | 0.6362 | 0.6656 | 14.13 | 9.32 | 17.0% | 0.6429 |
-| **UNet 2D (DiceFocal)** | 2D | 0.4643 | 0.5635 | 0.4709 | 0.5861 | 0.5864 | 17.47 | 13.09 | 25.6% | 0.5953 |
-| **UNet 2D (DiceCE)** | 2D | 0.3960 | 0.5470 | 0.4520 | 0.5440 | 0.5993 | 23.16 | 16.49 | 26.2% | 0.5908 |
-| **UNet 2D (No Aug)** | 2D | 0.4902 | 0.3609 | 0.2683 | 0.3100 | 0.5536 | 62.13 | 30.38 | 36.3% | 0.4514 |
+| **Attention UNet 2.5D** | 2.5D | 0.6586 | 0.5552 | 0.6775 | 0.6946 | 12.34 | 7.83 | **14.6%** | 0.4525 | **0.6942** |
+| **SegResNet 2.5D** | 2.5D | **0.6655** | **0.5627** | **0.6784** | **0.6977** | **11.08** | **7.30** | 14.7% | 0.3848 | 0.6764 |
+| **SegResNet 2D** | 2D | 0.6390 | 0.5425 | 0.6634 | 0.6579 | 13.27 | 9.12 | 18.5% | 0.4908 | 0.6725 |
+| **Attention UNet 2D** | 2D | 0.6218 | 0.5243 | 0.6452 | 0.6432 | 15.50 | 9.69 | 19.1% | 0.4354 | 0.6630 |
+| **UNet 2.5D** | 2.5D | 0.6224 | 0.5171 | 0.6362 | 0.6656 | 14.13 | 9.32 | 17.0% | **0.5156** | 0.6429 |
+| **UNet 2D (DiceFocal)** | 2D | 0.5635 | 0.4709 | 0.5861 | 0.5864 | 17.47 | 13.09 | 25.6% | 0.4643 | 0.5953 |
+| **UNet 2D (DiceCE)** | 2D | 0.5470 | 0.4520 | 0.5440 | 0.5993 | 23.16 | 16.49 | 26.2% | 0.3960 | 0.5908 |
+| **UNet 2D (No Aug)** | 2D | 0.3609 | 0.2683 | 0.3100 | 0.5536 | 62.13 | 30.38 | 36.3% | 0.4902 | 0.4514 |
 
 ---
 
@@ -351,19 +355,13 @@ python training/train.py \
     --save_path models/unet_dicefocal/unet_dicefocal.pth
 ```
 
-#### Step 3: Single Model Evaluation
+#### Step 3: Model Evaluation
 Evaluate a trained model checkpoint on the test set:
 ```bash
 python evaluation/evaluate_2_5d.py \
     --model_path models/attention_unet_2.5d/attention_unet_2.5d.pth \
     --report_path models/attention_unet_2.5d/test_evaluation_report.txt \
     --min_size 10
-```
-
-#### Step 4: Automated Batch Evaluation of All Models
-Run test evaluation across all 8 model directories:
-```bash
-bash scripts/evaluate_all.sh
 ```
 
 ---
