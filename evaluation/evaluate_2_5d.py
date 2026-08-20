@@ -2,6 +2,7 @@
 import os
 import sys
 import argparse
+import random
 import multiprocessing
 
 # Windows-specific environment configuration
@@ -21,6 +22,7 @@ if sys.platform == "win32":
 import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
+import monai
 from monai.networks.nets import UNet, AttentionUnet, SegResNet
 
 # 3rd party
@@ -29,20 +31,37 @@ import pandas as pd
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
-from scipy.ndimage import label, binary_erosion, find_objects
+from scipy.ndimage import label, binary_erosion, find_objects, distance_transform_edt
 from tqdm import tqdm
 
 # Local imports
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
-from training.train_2_5d import LIDC25DDataset, get_transforms
+from training.train_2_5d import LIDC25DDataset, get_transforms, get_model
 
 # Default Configuration Constants
 DEFAULT_MANIFEST = "preprocessed_data/dataset_manifest.csv"
 DEFAULT_MODEL_PATH = "models/attention_unet_2.5d/attention_unet_2.5d.pth"
+DEFAULT_SPLIT = "test"
 DEFAULT_BATCH_SIZE = 32
 DEFAULT_NUM_WORKERS = 8
 DEFAULT_MIN_SIZE = 10
 DEFAULT_REPORT_PATH = "models/attention_unet_2.5d/test_evaluation_report.txt"
+DEFAULT_THRESHOLD = 0.5
+DEFAULT_SEED = 42
+
+
+def set_seed(seed=42):
+    """
+    Sets global random seed for Python random, NumPy, PyTorch (CPU & CUDA), and MONAI
+    to guarantee full evaluation reproducibility.
+    """
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+    monai.utils.set_determinism(seed=seed)
 
 
 def remove_small_objects(binary_mask, min_size):
@@ -59,21 +78,27 @@ def remove_small_objects(binary_mask, min_size):
     return cleaned_mask
 
 
-def compute_surface_distances(pred_binary, gt_binary):
+def compute_surface_distances(pred_binary, gt_binary, spacing=None):
+    """
+    Computes HD95 and ASD in millimeters using distance_transform_edt.
+    spacing: tuple of mm-per-voxel for each axis, e.g. (mm_y, mm_x) for 2D
+             or (mm_y, mm_x, mm_z) for 3D. If None, distances are in pixels.
+    """
     if np.sum(pred_binary) == 0 or np.sum(gt_binary) == 0:
         return np.nan, np.nan
 
     pred_border = pred_binary ^ binary_erosion(pred_binary)
     gt_border = gt_binary ^ binary_erosion(gt_binary)
 
-    pred_pts = np.argwhere(pred_border)
-    gt_pts = np.argwhere(gt_border)
-
-    if len(pred_pts) == 0 or len(gt_pts) == 0:
+    if np.sum(pred_border) == 0 or np.sum(gt_border) == 0:
         return np.nan, np.nan
 
-    d_p2g = np.min(np.linalg.norm(pred_pts[:, None, :] - gt_pts[None, :, :], axis=2), axis=1)
-    d_g2p = np.min(np.linalg.norm(gt_pts[:, None, :] - pred_pts[None, :, :], axis=2), axis=1)
+    # EDT from gt/pred borders gives distance of each voxel to nearest surface point
+    dt_gt = distance_transform_edt(~gt_border, sampling=spacing)
+    dt_pred = distance_transform_edt(~pred_border, sampling=spacing)
+
+    d_p2g = dt_gt[pred_border]
+    d_g2p = dt_pred[gt_border]
 
     all_dists = np.concatenate([d_p2g, d_g2p])
     hd95 = float(np.percentile(all_dists, 95))
@@ -81,7 +106,11 @@ def compute_surface_distances(pred_binary, gt_binary):
     return hd95, asd
 
 
-def compute_single_mask_metrics(p_mask, g_mask):
+def compute_single_mask_metrics(p_mask, g_mask, spacing=None):
+    """
+    Computes Dice, IoU, Precision, Sensitivity, Specificity, HD95, ASD, and Failure flag.
+    HD95/ASD are in true mm when spacing is provided.
+    """
     p_sum = np.sum(p_mask)
     g_sum = np.sum(g_mask)
 
@@ -90,120 +119,140 @@ def compute_single_mask_metrics(p_mask, g_mask):
     fn = np.sum((p_mask == 0) & (g_mask == 1))
     tn = np.sum((p_mask == 0) & (g_mask == 0))
 
+    # Case 1: Both GT and Pred are empty (Perfect negative match)
     if g_sum == 0 and p_sum == 0:
         return {
-            "dice": 1.0, "iou": 1.0, "precision": 1.0, "sensitivity": 1.0, "specificity": 1.0,
-            "hd95": 0.0, "asd": 0.0, "is_failure": False, "is_empty_gt": True
+            "dice": 1.0, "iou": 1.0, "precision": 1.0, "sensitivity": np.nan, "specificity": 1.0,
+            "hd95": 0.0, "asd": 0.0, "is_failure": False, "is_false_alarm": False, "is_empty_gt": True
         }
 
+    # Case 2: GT is empty, but Pred contains false positives (False Alarm)
     if g_sum == 0 and p_sum > 0:
         spec = tn / (tn + fp + 1e-8)
         return {
-            "dice": 0.0, "iou": 0.0, "precision": 0.0, "sensitivity": 1.0, "specificity": spec,
-            "hd95": np.nan, "asd": np.nan, "is_failure": True, "is_empty_gt": True
+            "dice": 0.0, "iou": 0.0, "precision": 0.0, "sensitivity": np.nan, "specificity": spec,
+            "hd95": np.nan, "asd": np.nan, "is_failure": False, "is_false_alarm": True, "is_empty_gt": True
         }
 
+    # Case 3: GT is non-empty, but Pred is empty (False Negative / Missed Tumor)
     if g_sum > 0 and p_sum == 0:
         return {
             "dice": 0.0, "iou": 0.0, "precision": 0.0, "sensitivity": 0.0, "specificity": 1.0,
-            "hd95": np.nan, "asd": np.nan, "is_failure": True, "is_empty_gt": False
+            "hd95": np.nan, "asd": np.nan, "is_failure": True, "is_false_alarm": False, "is_empty_gt": False
         }
 
+    # Case 4: Both GT and Pred are non-empty
     dice = (2.0 * tp) / (2.0 * tp + fp + fn + 1e-8)
     iou = tp / (tp + fp + fn + 1e-8)
     prec = tp / (tp + fp + 1e-8)
     sens = tp / (tp + fn + 1e-8)
     spec = tn / (tn + fp + 1e-8)
 
-    hd95, asd = compute_surface_distances(p_mask > 0, g_mask > 0)
+    hd95, asd = compute_surface_distances(p_mask > 0, g_mask > 0, spacing=spacing)
     is_failure = bool(dice < 0.1)
 
     return {
         "dice": dice, "iou": iou, "precision": prec, "sensitivity": sens, "specificity": spec,
-        "hd95": hd95, "asd": asd, "is_failure": is_failure, "is_empty_gt": False
+        "hd95": hd95, "asd": asd, "is_failure": is_failure, "is_false_alarm": False, "is_empty_gt": False
     }
 
 
 def aggregate_metric_dict(list_of_metric_dicts):
+    """
+    Summarizes a list of metric dicts into mean values, failure rates, and false alarm rates.
+    Filters out np.nan values for sensitivity (empty GT slices).
+    """
     if not list_of_metric_dicts:
         return {
             "dice": 0.0, "iou": 0.0, "precision": 0.0, "sensitivity": 0.0, "specificity": 0.0,
-            "hd95": 0.0, "asd": 0.0, "failure_rate": 0.0, "count": 0
+            "hd95": 0.0, "asd": 0.0, "failure_rate": 0.0, "false_alarm_rate": 0.0, "count": 0
         }
 
     dices = [m["dice"] for m in list_of_metric_dicts]
     ious = [m["iou"] for m in list_of_metric_dicts]
     precs = [m["precision"] for m in list_of_metric_dicts]
-    senss = [m["sensitivity"] for m in list_of_metric_dicts]
+    senss = [m["sensitivity"] for m in list_of_metric_dicts if not np.isnan(m["sensitivity"])]
     specs = [m["specificity"] for m in list_of_metric_dicts]
 
     hd95s = [m["hd95"] for m in list_of_metric_dicts if not np.isnan(m["hd95"])]
     asds = [m["asd"] for m in list_of_metric_dicts if not np.isnan(m["asd"])]
-    failures = [1.0 if m["is_failure"] else 0.0 for m in list_of_metric_dicts]
+    failures = [1.0 if m.get("is_failure", False) else 0.0 for m in list_of_metric_dicts]
+    false_alarms = [1.0 if m.get("is_false_alarm", False) else 0.0 for m in list_of_metric_dicts]
 
     return {
         "dice": float(np.mean(dices)),
         "iou": float(np.mean(ious)),
         "precision": float(np.mean(precs)),
-        "sensitivity": float(np.mean(senss)),
+        "sensitivity": float(np.mean(senss)) if senss else 0.0,
         "specificity": float(np.mean(specs)),
         "hd95": float(np.mean(hd95s)) if hd95s else 0.0,
         "asd": float(np.mean(asds)) if asds else 0.0,
         "failure_rate": float(np.mean(failures)),
+        "false_alarm_rate": float(np.mean(false_alarms)),
         "count": len(list_of_metric_dicts)
     }
 
 
-def load_trained_model(model_path, device):
+def load_trained_model(model_path, device, in_channels=3):
     if not os.path.exists(model_path):
         print(f"Error: Model file '{model_path}' not found.")
         sys.exit(1)
 
-    print(f"Loading trained 2.5D MONAI UNet model from {model_path}...")
+    print(f"Loading trained 2.5D MONAI model from {model_path}...")
     checkpoint = torch.load(model_path, map_location=device)
-    state_dict = checkpoint["model_state_dict"]
+    state_dict = checkpoint.get("model_state_dict", checkpoint)
 
-    if "model_kwargs" in checkpoint:
-        model_kwargs = checkpoint["model_kwargs"]
-    else:
-        model_kwargs = {
-            "spatial_dims": 2,
-            "in_channels": 3,
-            "out_channels": 1,
-            "channels": (16, 32, 64, 128, 256),
-            "strides": (2, 2, 2, 2),
-            #"num_res_units": 2
-        }
-
-    try:
-        model = UNet(**model_kwargs).to(device)
-        model.load_state_dict(state_dict)
-    except Exception:
+    if "model_type" in checkpoint:
         try:
-            model = AttentionUnet(**model_kwargs).to(device)
+            model, _ = get_model(checkpoint["model_type"], in_channels=in_channels)
             model.load_state_dict(state_dict)
+            model.eval()
+            return model.to(device)
         except Exception:
-            model = SegResNet(**model_kwargs).to(device)
+            pass
+
+    import inspect
+    if "model_kwargs" in checkpoint and isinstance(checkpoint["model_kwargs"], dict):
+        kwargs = checkpoint["model_kwargs"].copy()
+        for model_cls in [UNet, AttentionUnet, SegResNet]:
+            try:
+                valid_params = inspect.signature(model_cls.__init__).parameters.keys()
+                filtered = {k: v for k, v in kwargs.items() if k in valid_params}
+                model = model_cls(**filtered)
+                model.load_state_dict(state_dict)
+                model.eval()
+                return model.to(device)
+            except Exception:
+                continue
+
+    for m_type in ["unet", "attention_unet", "segresnet"]:
+        try:
+            model, _ = get_model(m_type, in_channels=in_channels)
             model.load_state_dict(state_dict)
+            model.eval()
+            return model.to(device)
+        except Exception:
+            continue
 
-    model.eval()
-    return model
+    raise RuntimeError(f"Failed to load checkpoint from {model_path} into any supported 2.5D architecture.")
 
 
-def evaluate_test_set_hierarchical(model, loader, device, min_size):
+def evaluate_test_set_hierarchical(model, loader, device, min_size, threshold=0.5):
     model.eval()
 
     patient_3d_preds = {}
     patient_3d_gts = {}
+    patient_cropped_shapes = {}  # Cache per-patient cropped_shape for spacing computation
 
     slice_metrics_all = []
     slice_metrics_pos = []
 
-    print(f"\nRunning Comprehensive Evaluation on 2.5D Test Set (Component filter ≥{min_size}px)...")
+    print(f"\nRunning Comprehensive Evaluation on 2.5D Test Set (Component filter ≥{min_size}px, Threshold: {threshold})...")
 
     with torch.no_grad():
         for batch in tqdm(loader, desc="[Evaluating Test Slices]"):
             images, masks, pids, s_idxs = batch[0], batch[1], batch[2], batch[3]
+            cropped_shapes = batch[4]  # list of [H, W, Z] per sample
             images = images.to(device, non_blocking=True)
             masks = masks.to(device, non_blocking=True)
 
@@ -213,7 +262,7 @@ def evaluate_test_set_hierarchical(model, loader, device, min_size):
             else:
                 outputs = model(images)
 
-            preds_raw = (torch.sigmoid(outputs) > 0.5).float()
+            preds_raw = (torch.sigmoid(outputs) > threshold).float()
 
             preds_np = preds_raw.cpu().numpy()
             masks_np = masks.cpu().numpy()
@@ -224,16 +273,22 @@ def evaluate_test_set_hierarchical(model, loader, device, min_size):
                 pid = pids[b]
                 s_idx = int(s_idxs[b]) if not isinstance(s_idxs[b], int) else s_idxs[b]
 
+                # Compute per-patient 2D spacing in mm
+                cs_h = float(cropped_shapes[0][b])
+                cs_w = float(cropped_shapes[1][b])
+                spacing_2d = (cs_h / 256.0, cs_w / 256.0)
+
                 if min_size > 0:
                     p_mask = remove_small_objects(p_mask, min_size=min_size)
 
                 if pid not in patient_3d_preds:
                     patient_3d_preds[pid] = {}
                     patient_3d_gts[pid] = {}
+                    patient_cropped_shapes[pid] = (cs_h, cs_w)
                 patient_3d_preds[pid][s_idx] = p_mask
                 patient_3d_gts[pid][s_idx] = g_mask
 
-                m_slice = compute_single_mask_metrics(p_mask, g_mask)
+                m_slice = compute_single_mask_metrics(p_mask, g_mask, spacing=spacing_2d)
                 slice_metrics_all.append(m_slice)
                 if not m_slice["is_empty_gt"]:
                     slice_metrics_pos.append(m_slice)
@@ -252,7 +307,12 @@ def evaluate_test_set_hierarchical(model, loader, device, min_size):
         vol_pred = np.stack([patient_3d_preds[pid][k] for k in s_keys], axis=-1)
         vol_gt = np.stack([patient_3d_gts[pid][k] for k in s_keys], axis=-1)
 
-        m_patient = compute_single_mask_metrics(vol_pred, vol_gt)
+        # 3D spacing: X/Y from crop resize, Z = 1mm (stacked slices at 1mm isotropic)
+        cs_h, cs_w = patient_cropped_shapes[pid]
+        spacing_3d = (cs_h / 256.0, cs_w / 256.0, 1.0)
+        spacing_2d_patient = (cs_h / 256.0, cs_w / 256.0)
+
+        m_patient = compute_single_mask_metrics(vol_pred, vol_gt, spacing=spacing_3d)
         patient_metrics_all.append(m_patient)
         if not m_patient["is_empty_gt"]:
             patient_metrics_pos.append(m_patient)
@@ -265,7 +325,7 @@ def evaluate_test_set_hierarchical(model, loader, device, min_size):
         for k in s_keys:
             p_slice = patient_3d_preds[pid][k]
             g_slice = patient_3d_gts[pid][k]
-            m_2d = compute_single_mask_metrics(p_slice, g_slice)
+            m_2d = compute_single_mask_metrics(p_slice, g_slice, spacing=spacing_2d_patient)
             patient_2d_all_metrics.append(m_2d)
 
             if np.sum(g_slice) > 0:
@@ -302,7 +362,7 @@ def evaluate_test_set_hierarchical(model, loader, device, min_size):
                 nodule_pred_mask = vol_pred[bbox]
 
                 vol_voxels = int(np.sum(nodule_gt_mask))
-                m_nodule = compute_single_mask_metrics(nodule_pred_mask, nodule_gt_mask)
+                m_nodule = compute_single_mask_metrics(nodule_pred_mask, nodule_gt_mask, spacing=spacing_3d)
                 nodule_metrics_all.append(m_nodule)
 
                 if vol_voxels < 100:
@@ -329,17 +389,18 @@ def evaluate_test_set_hierarchical(model, loader, device, min_size):
     return results
 
 
-def print_and_format_report(results, min_size, report_path):
+def print_and_format_report(results, min_size, report_path, threshold=0.5):
     lines = []
     lines.append("=========================================================================================================")
-    lines.append(f"                   HIERARCHICAL EVALUATION REPORT (Filter ≥{min_size}px)")
+    lines.append(f"                   HIERARCHICAL EVALUATION REPORT (2.5D, Filter ≥{min_size}px, Threshold: {threshold})")
     lines.append("=========================================================================================================\n")
 
     def format_row(title, m):
         return (
             f"  {title:<32s} | Dice: {m['dice']:.4f} | IoU: {m['iou']:.4f} | "
             f"Prec: {m['precision']:.4f} | Sens: {m['sensitivity']:.4f} | Spec: {m['specificity']:.4f} | "
-            f"HD95: {m['hd95']:5.2f}mm | ASD: {m['asd']:5.2f}mm | Fail: {m['failure_rate']*100:5.1f}% | Count: {m['count']:4d}"
+            f"HD95: {m['hd95']:5.2f}mm | ASD: {m['asd']:5.2f}mm | Fail: {m['failure_rate']*100:5.1f}% | "
+            f"FA: {m.get('false_alarm_rate', 0.0)*100:5.1f}% | Count: {m['count']:4d}"
         )
 
     lines.append("1. PER-SLICE EVALUATION:")
@@ -404,22 +465,27 @@ def main():
     parser = argparse.ArgumentParser(description="Comprehensive Hierarchical Evaluation of MONAI 2.5D UNet")
     parser.add_argument("--manifest", type=str, default=DEFAULT_MANIFEST, help=f"Path to manifest CSV (default: {DEFAULT_MANIFEST})")
     parser.add_argument("--model_path", type=str, default=DEFAULT_MODEL_PATH, help=f"Path to trained model checkpoint (default: {DEFAULT_MODEL_PATH})")
+    parser.add_argument("--split", type=str, choices=["train", "val", "test"], default=DEFAULT_SPLIT, help=f"Dataset split to evaluate: train, val, or test (default: {DEFAULT_SPLIT})")
     parser.add_argument("--batch_size", type=int, default=DEFAULT_BATCH_SIZE, help=f"Batch size for evaluation (default: {DEFAULT_BATCH_SIZE})")
     parser.add_argument("--num_workers", type=int, default=DEFAULT_NUM_WORKERS, help=f"DataLoader num_workers (default: {DEFAULT_NUM_WORKERS})")
     parser.add_argument("--min_size", type=int, default=DEFAULT_MIN_SIZE, help=f"Minimum connected component size (in pixels) to keep (default: {DEFAULT_MIN_SIZE})")
+    parser.add_argument("--threshold", type=float, default=DEFAULT_THRESHOLD, help=f"Probability threshold for binarizing predictions (default: {DEFAULT_THRESHOLD})")
     parser.add_argument("--report_path", type=str, default=DEFAULT_REPORT_PATH, help=f"Output report text path (default: {DEFAULT_REPORT_PATH})")
+    parser.add_argument("--seed", type=int, default=DEFAULT_SEED, help=f"Global random seed for full evaluation reproducibility (default: {DEFAULT_SEED})")
 
     args = parser.parse_args()
+
+    set_seed(args.seed)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"\nEvaluating 2.5D Model on Device: {device}")
 
     _, val_transforms = get_transforms()
-    test_dataset = LIDC25DDataset(args.manifest, split="test", transform=val_transforms)
-    print(f"Loaded {len(test_dataset)} test slices from {args.manifest}.")
+    eval_dataset = LIDC25DDataset(args.manifest, split=args.split, transform=val_transforms, seed=args.seed)
+    print(f"Loaded {len(eval_dataset)} '{args.split}' slices from {args.manifest}.")
 
-    test_loader = DataLoader(
-        test_dataset,
+    eval_loader = DataLoader(
+        eval_dataset,
         batch_size=args.batch_size,
         shuffle=False,
         num_workers=args.num_workers,
@@ -427,9 +493,9 @@ def main():
     )
 
     model = load_trained_model(args.model_path, device)
-    results = evaluate_test_set_hierarchical(model, test_loader, device, min_size=args.min_size)
+    results = evaluate_test_set_hierarchical(model, eval_loader, device, min_size=args.min_size, threshold=args.threshold)
 
-    print_and_format_report(results, min_size=args.min_size, report_path=args.report_path)
+    print_and_format_report(results, min_size=args.min_size, report_path=args.report_path, threshold=args.threshold)
 
 
 if __name__ == "__main__":

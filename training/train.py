@@ -2,6 +2,7 @@
 import os
 import sys
 import time
+import json
 import random
 import argparse
 import multiprocessing
@@ -28,7 +29,7 @@ from torch.utils.data import Dataset, DataLoader
 
 import monai
 from monai.networks.nets import UNet, AttentionUnet, SegResNet
-from monai.losses import DiceFocalLoss, DiceCELoss, TverskyLoss
+from monai.losses import DiceFocalLoss, DiceCELoss, TverskyLoss, FocalLoss
 from monai.transforms import (
     Compose,
     Resized,
@@ -43,10 +44,9 @@ from monai.transforms import (
 import numpy as np
 import pandas as pd
 import matplotlib
-matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 from tqdm import tqdm
-from scipy.ndimage import label, binary_erosion
+from scipy.ndimage import label, binary_erosion, distance_transform_edt
 
 # Default Configuration Constants
 DEFAULT_MANIFEST = "preprocessed_data/dataset_manifest.csv"
@@ -61,6 +61,21 @@ DEFAULT_NEG_RATIO = 1.5
 DEFAULT_LOSS = "dice_focal"
 DEFAULT_MODEL_TYPE = "unet"
 DEFAULT_SAVE_PATH = "models/unet/unet.pth"
+DEFAULT_SEED = 42
+
+
+def set_seed(seed=42):
+    """
+    Sets random seed for Python random, NumPy, and PyTorch (CPU & CUDA)
+    for reproducible data shuffling and initial model weight generation,
+    without forcing MONAI CUDNN determinism lock.
+    """
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
 
 
 def get_loss_function(loss_name):
@@ -71,15 +86,17 @@ def get_loss_function(loss_name):
     name = loss_name.lower().replace("-", "_")
     if name in ["dice_ce", "dicece"]:
         return DiceCELoss(sigmoid=True, squared_pred=True)
-    elif name in ["tversky"]:
-        class TverskyCELoss(torch.nn.Module):
-            def __init__(self, alpha=0.3, beta=0.7):
+    elif name in ["tversky", "focal_tversky", "focaltversky"]:
+        class TverskyFocalLoss(torch.nn.Module):
+            def __init__(self, alpha=0.3, beta=0.7, gamma=2.0):
                 super().__init__()
-                self.tversky = TverskyLoss(sigmoid=True, alpha=alpha, beta=beta)
-                self.bce = torch.nn.BCEWithLogitsLoss()
-            def forward(self, input, target):
-                return self.tversky(input, target) + self.bce(input, target)
-        return TverskyCELoss(alpha=0.3, beta=0.7)
+                self.tversky = TverskyLoss(sigmoid=True, alpha=alpha, beta=beta, smooth_nr=1e-4, smooth_dr=1e-4)
+                self.focal = FocalLoss(include_background=True, to_onehot_y=False, gamma=gamma)
+
+            def forward(self, pred, target):
+                return self.tversky(pred, target) + self.focal(pred, target)
+
+        return TverskyFocalLoss(alpha=0.3, beta=0.7, gamma=2.0)
     elif name in ["dice_focal", "dicefocal"]:
         return DiceFocalLoss(sigmoid=True, squared_pred=True, gamma=2.0)
     else:
@@ -145,11 +162,11 @@ def remove_small_objects(binary_mask, min_size):
     return cleaned_mask
 
 
-def compute_surface_distances(pred_binary, gt_binary):
+def compute_surface_distances(pred_binary, gt_binary, spacing=None):
     """
-    Computes 95th Percentile Hausdorff Distance (HD95) and Average Surface Distance (ASD)
-    between 2D/3D binary prediction and ground truth masks.
-    Returns (np.nan, np.nan) if either mask is empty.
+    Computes HD95 and ASD in millimeters using distance_transform_edt.
+    spacing: tuple of mm-per-voxel for each axis, e.g. (mm_y, mm_x) for 2D
+             or (mm_y, mm_x, mm_z) for 3D. If None, distances are in pixels.
     """
     if np.sum(pred_binary) == 0 or np.sum(gt_binary) == 0:
         return np.nan, np.nan
@@ -157,15 +174,15 @@ def compute_surface_distances(pred_binary, gt_binary):
     pred_border = pred_binary ^ binary_erosion(pred_binary)
     gt_border = gt_binary ^ binary_erosion(gt_binary)
 
-    pred_pts = np.argwhere(pred_border)
-    gt_pts = np.argwhere(gt_border)
-
-    if len(pred_pts) == 0 or len(gt_pts) == 0:
+    if np.sum(pred_border) == 0 or np.sum(gt_border) == 0:
         return np.nan, np.nan
 
-    # Calculate surface point distances efficiently
-    d_p2g = np.min(np.linalg.norm(pred_pts[:, None, :] - gt_pts[None, :, :], axis=2), axis=1)
-    d_g2p = np.min(np.linalg.norm(gt_pts[:, None, :] - pred_pts[None, :, :], axis=2), axis=1)
+    # EDT from gt/pred borders gives distance of each voxel to nearest surface point
+    dt_gt = distance_transform_edt(~gt_border, sampling=spacing)
+    dt_pred = distance_transform_edt(~pred_border, sampling=spacing)
+
+    d_p2g = dt_gt[pred_border]
+    d_g2p = dt_pred[gt_border]
 
     all_dists = np.concatenate([d_p2g, d_g2p])
     hd95 = float(np.percentile(all_dists, 95))
@@ -207,13 +224,9 @@ class LIDC2DDataset(Dataset):
         """
         Dynamically resamples negative background slices per patient for the current epoch,
         retaining 100% of positive tumor slices and a fresh 1.5x subset of negative slices.
-        Seed varies deterministically with epoch for full reproducibility across runs.
         """
         if self.split != "train":
             return
-
-        epoch_seed = self.seed + int(epoch)
-        rng = np.random.RandomState(epoch_seed)
 
         patient_sampled_list = []
         for pid, p_df in self.full_split_df.groupby("patient_id"):
@@ -227,7 +240,7 @@ class LIDC2DDataset(Dataset):
                 target_neg_count = min(len(neg_df), 20)  # Baseline negative sampling for clean scans
 
             if len(neg_df) > 0:
-                sampled_neg_indices = rng.choice(len(neg_df), size=min(len(neg_df), target_neg_count), replace=False)
+                sampled_neg_indices = np.random.choice(len(neg_df), size=min(len(neg_df), target_neg_count), replace=False)
                 sampled_neg_df = neg_df.iloc[sampled_neg_indices]
             else:
                 sampled_neg_df = neg_df
@@ -246,6 +259,8 @@ class LIDC2DDataset(Dataset):
         with np.load(filepath) as npz_data:
             image = torch.from_numpy(npz_data["image"].astype(np.float32))
             mask = torch.from_numpy(npz_data["mask"].astype(np.float32))
+            spatial_meta = json.loads(str(npz_data["spatial_meta"]))
+            cropped_shape = spatial_meta["cropped_shape"]  # [H, W, Z] in mm (1mm isotropic)
 
         sample = {"image": image, "mask": mask}
 
@@ -254,7 +269,7 @@ class LIDC2DDataset(Dataset):
 
         pid = str(row["patient_id"])
         slice_idx = int(row["slice_idx"])
-        return sample["image"], sample["mask"], pid, slice_idx
+        return sample["image"], sample["mask"], pid, slice_idx, cropped_shape
 
 
 def get_transforms(no_augmentations=False):
@@ -286,12 +301,12 @@ def get_transforms(no_augmentations=False):
             ),
             RandFlipd(
                 keys=["image", "mask"],
-                spatial_axis=0,                # Horizontal flip
+                spatial_axis=0,
                 prob=0.5
             ),
             RandFlipd(
                 keys=["image", "mask"],
-                spatial_axis=1,                # Vertical flip
+                spatial_axis=1,
                 prob=0.5
             ),
             RandGaussianNoised(
@@ -331,6 +346,7 @@ def plot_training_history(history, save_path="models/unet/training_history.png")
     if not epochs:
         return
 
+    matplotlib.use('Agg')
     fig, axes = plt.subplots(2, 2, figsize=(14, 10))
 
     # 1. Training Loss
@@ -389,9 +405,9 @@ def plot_training_history(history, save_path="models/unet/training_history.png")
     plt.close()
 
 
-def train_epoch(model, loader, optimizer, loss_fn, device, epoch, total_epochs, scaler=None):
+def train_epoch(model, loader, optimizer, loss_fn, device, epoch, total_epochs, scaler=None, amp_dtype=torch.float16):
     """
-    Trains MONAI UNet for 1 epoch using PyTorch AMP FP16 / FP32 precision.
+    Trains MONAI UNet for 1 epoch using PyTorch AMP (BF16 / FP16) precision.
     """
     model.train()
     running_loss = 0.0
@@ -399,23 +415,39 @@ def train_epoch(model, loader, optimizer, loss_fn, device, epoch, total_epochs, 
 
     pbar = tqdm(loader, desc=f"Epoch {epoch:02d}/{total_epochs:02d} [Train]", leave=False, dynamic_ncols=True)
     for batch_idx, batch in enumerate(pbar, 1):
-        images, masks = batch[0], batch[1]
+        images, masks = batch[0], batch[1]  # batch[2:] = pid, slice_idx, cropped_shape (unused in training)
         images = images.to(device, non_blocking=True)
         masks = masks.to(device, non_blocking=True)
 
         optimizer.zero_grad()
 
-        if scaler is not None and device.type == "cuda":
-            with torch.amp.autocast('cuda'):
+        if device.type == "cuda":
+            with torch.amp.autocast('cuda', dtype=amp_dtype):
                 logits = model(images)
                 loss = loss_fn(logits, masks)
-            scaler.scale(loss).backward()
-            scaler.step(optimizer)
-            scaler.update()
+
+            if torch.isnan(loss) or torch.isinf(loss):
+                optimizer.zero_grad()
+                continue
+
+            if scaler is not None:
+                scaler.scale(loss).backward()
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                optimizer.step()
         else:
             logits = model(images)
             loss = loss_fn(logits, masks)
+            if torch.isnan(loss) or torch.isinf(loss):
+                optimizer.zero_grad()
+                continue
             loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
 
         loss_val = loss.item()
@@ -427,7 +459,7 @@ def train_epoch(model, loader, optimizer, loss_fn, device, epoch, total_epochs, 
     return epoch_loss, elapsed
 
 
-def validate_epoch(model, loader, device, val_min_size, use_amp=True):
+def validate_epoch(model, loader, device, val_min_size, use_amp=True, amp_dtype=torch.float16):
     """
     Evaluates MONAI UNet on validation set with macro-aggregated per-sample metrics:
     - Dice, IoU, Precision, Sensitivity (Recall), Specificity, HD95, ASD, Failure Rate, 3D Volumetric Dice.
@@ -447,15 +479,18 @@ def validate_epoch(model, loader, device, val_min_size, use_amp=True):
     failures = 0
     total_pos_samples = 0
 
+    patient_cropped_shapes = {}  # Cache per-patient cropped_shape for 3D spacing
+
     pbar = tqdm(loader, desc="[Val]", leave=False, dynamic_ncols=True)
     with torch.no_grad():
         for batch in pbar:
             images, masks, pids, s_idxs = batch[0], batch[1], batch[2], batch[3]
+            cropped_shapes = batch[4]  # list of [H, W, Z] per sample
             images = images.to(device, non_blocking=True)
             masks = masks.to(device, non_blocking=True)
 
             if use_amp and device.type == "cuda":
-                with torch.amp.autocast('cuda'):
+                with torch.amp.autocast('cuda', dtype=amp_dtype):
                     logits = model(images)
             else:
                 logits = model(images)
@@ -470,6 +505,11 @@ def validate_epoch(model, loader, device, val_min_size, use_amp=True):
                 pid = pids[b]
                 s_idx = int(s_idxs[b])
 
+                # Compute per-patient 2D spacing in mm (cropped_shape is in mm since resampled to 1mm isotropic)
+                cs_h = float(cropped_shapes[0][b])
+                cs_w = float(cropped_shapes[1][b])
+                spacing_2d = (cs_h / 256.0, cs_w / 256.0)
+
                 if val_min_size > 0:
                     p_mask_bool = remove_small_objects(p_mask_bool, min_size=val_min_size)
 
@@ -477,6 +517,7 @@ def validate_epoch(model, loader, device, val_min_size, use_amp=True):
                 if pid not in patient_3d_preds:
                     patient_3d_preds[pid] = {}
                     patient_3d_gts[pid] = {}
+                    patient_cropped_shapes[pid] = (cs_h, cs_w)
                 patient_3d_preds[pid][s_idx] = p_mask_bool
                 patient_3d_gts[pid][s_idx] = g_mask_bool
 
@@ -503,8 +544,8 @@ def validate_epoch(model, loader, device, val_min_size, use_amp=True):
                     if dice < 0.1:  # Nodule detection failure threshold
                         failures += 1
 
-                    # Surface distances (HD95 & ASD)
-                    hd95, asd = compute_surface_distances(p_mask_bool, g_mask_bool)
+                    # Surface distances (HD95 & ASD) in true millimeters
+                    hd95, asd = compute_surface_distances(p_mask_bool, g_mask_bool, spacing=spacing_2d)
                     if not np.isnan(hd95):
                         sample_hd95s.append(hd95)
                         sample_asds.append(asd)
@@ -535,8 +576,8 @@ def validate_epoch(model, loader, device, val_min_size, use_amp=True):
         "val_3d_dice": float(np.mean(patient_3d_dices)) if patient_3d_dices else 0.0
     }
 
-    # Combined composite validation score for robust model selection (Dice + IoU + Sensitivity)
-    metrics["composite_score"] = (metrics["dice"] + metrics["iou"] + metrics["sensitivity"]) / 3.0
+    # Combined composite validation score for robust model selection (Dice + Sensitivity + Precision)
+    metrics["composite_score"] = (metrics["dice"] + metrics["sensitivity"] + metrics["precision"]) / 3.0
 
     # Explicitly clear 3D volume dictionaries and trigger garbage collection
     del patient_3d_preds, patient_3d_gts
@@ -557,13 +598,17 @@ def main():
     parser.add_argument("--weight_decay", type=float, default=DEFAULT_WEIGHT_DECAY, help=f"Weight decay for AdamW optimizer (default: {DEFAULT_WEIGHT_DECAY})")
     parser.add_argument("--num_workers", type=int, default=DEFAULT_NUM_WORKERS, help=f"DataLoader num_workers (default: {DEFAULT_NUM_WORKERS})")
     parser.add_argument("--neg_ratio", type=float, default=DEFAULT_NEG_RATIO, help=f"Ratio of negative slices to positive slices for dynamic epoch resampling (default: {DEFAULT_NEG_RATIO})")
-    parser.add_argument("--loss", type=str, choices=["dice_focal", "dice_ce", "tversky"], default=DEFAULT_LOSS, help=f"Loss function to optimize: dice_focal, dice_ce, or tversky (default: {DEFAULT_LOSS})")
+    parser.add_argument("--loss", type=str, choices=["dice_focal", "dice_ce", "tversky", "focal_tversky"], default=DEFAULT_LOSS, help=f"Loss function to optimize: dice_focal, dice_ce, tversky, or focal_tversky (default: {DEFAULT_LOSS})")
     parser.add_argument("--model_type", "--model", type=str, choices=["unet", "attention_unet", "segresnet"], default=DEFAULT_MODEL_TYPE, help=f"Model architecture to train: unet, attention_unet, or segresnet (default: {DEFAULT_MODEL_TYPE})")
     parser.add_argument("--no_transforms", "--no_aug", action="store_true", help="Disable random data augmentations during training (keeps 256x256 resizing only)")
     parser.add_argument("--save_path", "--model_path", type=str, default=DEFAULT_SAVE_PATH, help=f"Path to save best model checkpoint or output folder (default: {DEFAULT_SAVE_PATH})")
+    parser.add_argument("--seed", type=int, default=DEFAULT_SEED, help=f"Random seed for data sampling & initial weights (default: {DEFAULT_SEED})")
     parser.add_argument("--resume", action="store_true", help="Resume training from latest checkpoint if available")
 
     args = parser.parse_args()
+
+    # Set seed for PyTorch, NumPy, and Python without forcing CUDNN determinism lock
+    set_seed(args.seed)
 
     # Automatically derive default save directory based on chosen model_type if default path was used
     if args.save_path == DEFAULT_SAVE_PATH and args.model_type != DEFAULT_MODEL_TYPE:
@@ -586,11 +631,17 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     if device.type == "cuda":
         torch.backends.cudnn.benchmark = True
+        amp_dtype = torch.float16
+        scaler = torch.amp.GradScaler('cuda')
+        print(f"Device: {device} | AMP Dtype: {amp_dtype} | GradScaler: {scaler is not None}")
+    else:
+        amp_dtype = torch.float32
+        scaler = None
 
     train_transforms, val_transforms = get_transforms(no_augmentations=args.no_transforms)
 
-    train_dataset = LIDC2DDataset(args.manifest, split="train", transform=train_transforms, neg_ratio=args.neg_ratio)
-    val_dataset = LIDC2DDataset(args.manifest, split="val", transform=val_transforms)
+    train_dataset = LIDC2DDataset(args.manifest, split="train", transform=train_transforms, neg_ratio=args.neg_ratio, seed=args.seed)
+    val_dataset = LIDC2DDataset(args.manifest, split="val", transform=val_transforms, seed=args.seed)
 
     train_loader = DataLoader(
         train_dataset,
@@ -599,8 +650,7 @@ def main():
         num_workers=args.num_workers,
         pin_memory=True if device.type == "cuda" else False,
         persistent_workers=False,  # MUST be False so workers refresh and fetch newly resampled slices every epoch!
-        prefetch_factor=2 if args.num_workers > 0 else None,
-        worker_init_fn=worker_init_fn if args.num_workers > 0 else None
+        prefetch_factor=2 if args.num_workers > 0 else None
     )
 
     val_loader = DataLoader(
@@ -610,8 +660,7 @@ def main():
         num_workers=args.num_workers,
         pin_memory=True if device.type == "cuda" else False,
         persistent_workers=True if args.num_workers > 0 else False,
-        prefetch_factor=2 if args.num_workers > 0 else None,
-        worker_init_fn=worker_init_fn if args.num_workers > 0 else None
+        prefetch_factor=2 if args.num_workers > 0 else None
     )
 
     model, model_kwargs = get_model(args.model_type, in_channels=1)
@@ -619,7 +668,6 @@ def main():
 
     loss_fn = get_loss_function(args.loss)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay, fused=True if device.type == 'cuda' else False)
-    scaler = torch.amp.GradScaler('cuda') if device.type == "cuda" else None
 
     start_epoch = 1
     best_composite_score = 0.0
@@ -660,8 +708,8 @@ def main():
         if hasattr(train_dataset, "resample_epoch"):
             train_dataset.resample_epoch(epoch=epoch)
 
-        train_loss, train_time = train_epoch(model, train_loader, optimizer, loss_fn, device, epoch, args.epochs, scaler=scaler)
-        val_metrics = validate_epoch(model, val_loader, device, args.val_min_size, use_amp=True)
+        train_loss, train_time = train_epoch(model, train_loader, optimizer, loss_fn, device, epoch, args.epochs, scaler=scaler, amp_dtype=amp_dtype)
+        val_metrics = validate_epoch(model, val_loader, device, args.val_min_size, use_amp=True, amp_dtype=amp_dtype)
         current_lr = optimizer.param_groups[0]["lr"]
 
         scheduler.step()
@@ -689,7 +737,8 @@ def main():
                 "val_dice": val_metrics["dice"],
                 "val_3d_dice": val_metrics["val_3d_dice"],
                 "val_metrics": val_metrics,
-                "model_kwargs": model_kwargs
+                "model_kwargs": model_kwargs,
+                "model_type": args.model_type
             }, best_model_path)
 
         # Save checkpoint after EVERY epoch
