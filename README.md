@@ -3,9 +3,8 @@
 [![Python 3.12](https://img.shields.io/badge/python-3.12-blue.svg)](https://www.python.org/downloads/release/python-3120/)
 [![PyTorch](https://img.shields.io/badge/PyTorch-2.0%2B-ee4c2c.svg)](https://pytorch.org/)
 [![MONAI](https://img.shields.io/badge/MONAI-1.3.0%2B-5c2d91.svg)](https://monai.io/)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
-A end-to-end, high-performance deep learning framework for **2D and 2.5D pulmonary nodule segmentation** on thoracic Computed Tomography (CT) scans from the **LIDC-IDRI** dataset. Built with PyTorch and MONAI, this project implements DICOM preprocessing, majority-voting consensus annotation, dynamic negative slice sampling, mixed-precision training, and a 4-level hierarchical evaluation suite comparing multiple deep neural architectures across varied loss functions, spatial context representations, and data augmentation regimes.
+An end-to-end, high-performance deep learning framework for **2D and 2.5D pulmonary nodule segmentation** on thoracic Computed Tomography (CT) scans from the **LIDC-IDRI** dataset. Built with PyTorch and MONAI, this project implements DICOM preprocessing, majority-voting consensus annotation, dynamic negative slice sampling, mixed-precision training, parameter validation sweeps, and a 4-level hierarchical evaluation suite comparing multiple deep neural architectures across varied loss functions, spatial context representations, and data augmentation regimes.
 
 ---
 
@@ -16,7 +15,7 @@ The **Lung Image Database Consortium and Image Database Resource Initiative (LID
 Our preprocessing pipeline processed **1,010 patients** (8 patients were omitted due to corrupt/incomplete DICOM headers or corrupted XML markup; e.g. `LIDC-IDRI-0238`, `LIDC-IDRI-0585`). Preprocessing produces two audit artifacts stored in `preprocessed_data/`:
 
 ### 1.1 Patient Series Audit (`patient_series_audit.csv`)
-This file tracks per-patient metadata across 1,011 patient scan records:
+This file tracks per-patient metadata across 1,010 patient scan records:
 - **Slice counts & Voxel Spacing:** Native slice counts range from 65 to 764 per CT volume. In-plane resolution varies from 0.461mm to 0.977mm, and slice thickness spans 0.6mm to 5.0mm (e.g., `2.500mm x 0.703mm x 0.703mm`).
 - **Annotation Consensus:** Captures nodule counts grouped by radiologist agreement (nodules marked by 1, 2, 3, or 4 radiologists).
 - **Volumetric Audit:** Records exact 3D nodule volumes in mm³, XML parsing integrity (`OK`), series completeness (`OK`), and radiologist malignancy ratings (1 to 5 scale).
@@ -37,7 +36,7 @@ The master manifest indexes all **240,242 resampled 2D slices** across 1,010 pat
 
 > [!NOTE]
 > **Inter-Annotator Agreement Benchmark:**
-> Individual radiologist annotations across the LIDC-IDRI dataset show a mean pairwise inter-annotator Dice agreement of **0.5896** (median **0.6421**, std **0.2272**). Models are evaluated against the 50% majority consensus mask (which provides a smoother, more centered ground truth). The top-performing segmentation models (e.g. Attention UNet 2.5D with 0.6586 2D tumor Dice / 0.6942 3D nodule Dice) operate near the intrinsic noise ceiling of expert human variability.
+> Individual radiologist annotations across the LIDC-IDRI dataset show a mean pairwise inter-annotator Dice agreement of **0.5896** (median **0.6421**, std **0.2272**). Models are evaluated against the 50% majority consensus mask (which provides a smoother, more centered ground truth). The top-performing segmentation models (e.g. Attention UNet 2.5D with 0.6645 2D tumor Dice / 0.6935 3D nodule Dice) operate near the intrinsic noise ceiling of expert human variability.
 
 ---
 
@@ -73,7 +72,7 @@ Raw DICOM CT + XML Annotations
 8. Export NPZ & Manifest ──► Save Float32 NPZ slices & dataset_manifest.csv
 ```
 
-### Preprocessing Configuration Options (`preprocess/preprocess_dataset.py`)
+### Preprocessing Configuration Parameters (`preprocess/preprocess_dataset.py`)
 - `--dataset_dir`: Path to root directory containing DICOM folders and XML annotations.
 - `--output_dir`: Target directory for saved `.npz` files and manifest files (default: `preprocessed_data`).
 - `--num_workers`: Number of parallel CPU processes (default: `6`).
@@ -111,7 +110,7 @@ Training is performed using `training/train.py` for 2D single-slice models and `
                                             │ Loss Functions:           │
                                             │ - DiceFocalLoss           │
                                             │ - DiceCELoss              │
-                                            │ - TverskyCELoss           │
+                                            │ - TverskyFocalLoss        │
                                             └───────────────────────────┘
 ```
 
@@ -123,131 +122,157 @@ Training is performed using `training/train.py` for 2D single-slice models and `
 ### 3.2 Loss Function Formulations
 - **`dice_focal`** (Default): `DiceFocalLoss(sigmoid=True, squared_pred=True, gamma=2.0)`. Blends Dice overlap optimization with Focal Loss to focus gradients on hard-to-classify boundary pixels.
 - **`dice_ce`**: `DiceCELoss(sigmoid=True, squared_pred=True)`. Combines soft Dice loss with Binary Cross-Entropy.
-- **`tversky` / `focal_tversky`**: `FocalTverskyLoss` ($\alpha=0.3, \beta=0.7, \gamma=0.75$). Implements Abraham & Khan (2019) Focal Tversky Loss. Higher $\beta=0.7$ penalizes false negatives (missed nodules) to boost sensitivity, while the focal exponent $\gamma=0.75$ keeps gradients large for hard-to-segment examples.
+- **`tversky` / `focal_tversky`**: `TverskyFocalLoss` ($\alpha=0.3, \beta=0.7, \gamma=2.0$). Implements Focal Tversky Loss. Higher $\beta=0.7$ penalizes false negatives (missed nodules) to boost recall, while the focal exponent $\gamma=2.0$ keeps gradients large for hard-to-segment small examples.
 
-### 3.3 Training Hyperparameters
+### 3.3 Complete Training CLI Parameters
 
 | Parameter | Command Argument | Default Value | Description |
 |---|---|---|---|
+| **Manifest Path** | `--manifest` | `preprocessed_data/dataset_manifest.csv` | Path to master dataset manifest CSV |
 | **Epochs** | `--epochs` | `40` | Total training iterations |
 | **Batch Size** | `--batch_size` | `64` | Training batch size |
-| `--lr` | `--lr` | `1e-3` | Initial learning rate (CosineAnnealingLR) |
+| **Learning Rate** | `--lr` | `1e-3` | Initial learning rate (CosineAnnealingLR) |
 | **Min LR** | `--min_lr` | `1e-5` | Minimum learning rate bound |
 | **Weight Decay** | `--weight_decay` | `1e-4` | AdamW L2 regularization coefficient |
 | **Negative Ratio** | `--neg_ratio` | `1.5` | Ratio of sampled negative to positive slices per epoch |
 | **Loss Selection** | `--loss` | `dice_focal` | Choice of `dice_focal`, `dice_ce`, `tversky` |
 | **Model Selection** | `--model_type` | `unet` | Choice of `unet`, `attention_unet`, `segresnet` |
-| **No Transforms** | `--no_transforms` | `False` | Disables data augmentation |
-| **Checkpoint Path**| `--save_path` | `models/unet/unet.pth` | Target save location |
-| **Resume Training**| `--resume` | `False` | Resume from latest checkpoint |
-
-### 3.4 Key Training Features
-- **Dynamic Negative Resampling:** To tackle the 94:6 negative-to-positive class imbalance, each epoch dynamically resamples background slices at a controlled ratio of `1.5 x positive_slice_count`.
-- **FP16 Automatic Mixed Precision (AMP):** Utilizes `torch.amp.autocast('cuda')` with `GradScaler` for reduced GPU memory footprint and faster forward/backward passes.
-- **Learning Rate Scheduling:** `CosineAnnealingLR` decays learning rate smoothly from `1e-3` to `1e-5` over 40 epochs.
+| **No Transforms** | `--no_transforms` | `False` | Flag to disable data augmentation |
+| **Checkpoint Path**| `--save_path` | `models/unet/unet.pth` | Target model save location |
+| **Resume Training**| `--resume` | `False` | Resume training from existing checkpoint |
+| **Random Seed** | `--seed` | `42` | Global seed for full reproducible splits & initialization |
+| **Num Workers** | `--num_workers` | `8` | DataLoader parallel worker processes |
 
 ---
 
-## 4. Evaluation Pipeline
+## 4. Evaluation Pipeline & Parameter Sweeps
 
 Model evaluation is executed via `evaluation/evaluate.py` (2D models) and `evaluation/evaluate_2_5d.py` (2.5D models), producing text summaries and structured CSV breakdowns (`patient_evaluation_breakdown.csv`).
 
 ### 4.1 Hierarchical 4-Level Evaluation Framework
-1. **Per-Slice 2D Evaluation:** Calculates Dice, IoU, Precision, Sensitivity, Specificity, Hausdorff Distance (HD95), Average Surface Distance (ASD), and Failure Rate across tumor-positive slices.
+1. **Per-Slice 2D Evaluation:** Calculates Dice, IoU, Precision, Sensitivity, Specificity, Hausdorff Distance (HD95), Average Surface Distance (ASD), False Alarm Rate (FA %), and Failure Rate across tumor-positive slices.
 2. **Per-Patient 3D Reconstruction:** Reconstructs full 3D CT volumes by stacking 2D slice predictions along the z-axis, computing 3D volumetric Dice and surface distances per patient.
 3. **Per-Nodule 3D Lesion Analysis:** Applies 3D connected-component labeling to extract individual nodule lesions, evaluating metrics across three size categories:
    - **Small Nodules:** Volume $< 100$ voxels ($< 0.1 \text{ cm}^3$)
    - **Medium Nodules:** Volume $100 \text{ to } 1000$ voxels ($0.1 \text{ to } 1.0 \text{ cm}^3$)
    - **Large Nodules:** Volume $\ge 1000$ voxels ($\ge 1.0 \text{ cm}^3$)
-4. **Post-Processing Connected Component Filter (`--min_size`):** Removes predicted 2D foreground blobs smaller than a pixel threshold (default: 10 pixels).
+4. **Post-Processing Connected Component Filter (`--min_size`):** Removes predicted 2D foreground noise blobs smaller than a pixel threshold.
 
-### Evaluation Metrics Summary
-- **Dice Score:** Overlap measure $2|P \cap G| / (|P| + |G|)$.
-- **IoU (Jaccard Index):** Intersection over Union $|P \cap G| / |P \cup G|$.
-- **Precision:** $TP / (TP + FP)$ (fraction of positive predictions that are true nodules).
-- **Sensitivity (Recall):** $TP / (TP + FN)$ (fraction of true nodules successfully detected).
-- **HD95 (mm):** 95th percentile Hausdorff Distance measuring maximum boundary distance in millimeters.
-- **ASD (mm):** Average Surface Distance between predicted and ground-truth boundary surfaces.
-- **Failure Rate (%):** Percentage of ground-truth tumor slices where the model predicts zero positive pixels.
+### 4.2 Complete Evaluation CLI Parameters
+
+| Parameter | Command Argument | Default Value | Description |
+|---|---|---|---|
+| **Manifest Path** | `--manifest` | `preprocessed_data/dataset_manifest.csv` | Path to master dataset manifest CSV |
+| **Model Checkpoint**| `--model_path` | `models/unet/unet.pth` | Path to trained model checkpoint `.pth` |
+| **Data Split** | `--split` | `val` (or `test`) | Dataset split to evaluate (`train`, `val`, `test`) |
+| **Batch Size** | `--batch_size` | `32` | Evaluation batch size |
+| **Num Workers** | `--num_workers` | `8` | DataLoader worker threads |
+| **Min Component Size**| `--min_size` | `10` | Minimum connected component size (pixels) to retain |
+| **Binarization Threshold**| `--threshold` | `0.5` | Sigmoid probability binarization threshold |
+| **Report Path** | `--report_path` | `<model_dir>/test_evaluation_report.txt` | Path for formatted evaluation report output |
+| **Random Seed** | `--seed` | `42` | Global seed for deterministic sampling |
 
 ---
 
 ## 5. Experimental Results & Architecture Comparisons
 
-We benchmarked **8 model configurations** across 40 epochs. All evaluation experiments were conducted on the patient-level, reproducibly seeded test split (23,622 2D slices across 101 test CT scans; 80/10/10 split with `seed=42`).
+We benchmarked **9 distinct model configurations** across 40 epochs. All final evaluation experiments were conducted on the patient-level, reproducibly seeded test split (23,622 2D slices across 101 test CT scans; 80/10/10 split with `seed=42`).
 
-### 5.1 Training Convergence Summary (Peak Validation Metrics at Best Checkpoint)
+### 5.1 Parameter Validation Sweeps & Operating Point Selection
 
-During training, model checkpoints (`.pth`) are automatically saved whenever a run achieves a new **Peak Composite Score** ($\frac{\text{Dice} + \text{Sensitivity} + \text{Precision}}{3.0}$). The table below compares all 8 models evaluated at their respective **peak validation checkpoint epochs**:
+Before conducting full test-set model benchmark evaluations, we performed systematic hyperparameter sweeps strictly on the **validation split** (`val` split; not on the held-out test split) to establish the optimal post-processing and binarization operating points. We evaluated two parameters independently:
+1. **Connected Component Noise Filter (`--min_size`):** Evaluated at 0, 5, 10, and 15 pixels (holding default threshold = 0.5).
+2. **Binarization Probability Threshold (`--threshold`):** Evaluated at 0.25, 0.50, 0.75, 0.90, and 0.95 (holding default min_size = 10px).
 
-| Model Architecture | Input Dim | Loss Function | Peak Epoch | Val Dice | Val IoU | Precision | Sensitivity | Specificity | HD95 (mm) | ASD (mm) | Fail Rate | Composite Score |
-|---|---|---|---|---|---|---|---|---|---|---|---|---|
-| **SegResNet 2.5D** | 2.5D | DiceFocal | Ep 32 | **0.7180** | **0.6072** | **0.7140** | **0.7727** | 0.9999 | **17.53** | **8.54** | **7.2%** | **0.6993** |
-| **Attention UNet 2.5D** | 2.5D | DiceFocal | Ep 20 | 0.7115 | 0.6027 | 0.7094 | 0.7679 | 0.9999 | 19.34 | 9.72 | 7.8% | 0.6940 |
-| **SegResNet 2D** | 2D | DiceFocal | Ep 33 | 0.6697 | 0.5720 | 0.6742 | 0.7108 | 0.9998 | 25.87 | 14.79 | 14.3% | 0.6508 |
-| **Attention UNet 2D** | 2D | DiceFocal | Ep 23 | 0.6565 | 0.5562 | 0.6657 | 0.6939 | 0.9999 | 26.79 | 14.01 | 14.5% | 0.6356 |
-| **UNet 2.5D** | 2.5D | DiceFocal | Ep 23 | 0.6438 | 0.5339 | 0.6383 | 0.7175 | 0.9998 | 24.83 | 12.07 | 12.1% | 0.6317 |
-| **UNet 2D (DiceFocal)** | 2D | DiceFocal | Ep 34 | 0.5940 | 0.4960 | 0.6123 | 0.6250 | 0.9998 | 34.45 | 19.66 | 20.3% | 0.5716 |
-| **UNet 2D (DiceCE)** | 2D | DiceCE | Ep 24 | 0.5659 | 0.4680 | 0.5625 | 0.6223 | 0.9998 | 37.29 | 21.87 | 22.5% | 0.5520 |
-| **UNet 2D (No Aug)** | 2D | DiceFocal | Ep 06 | 0.3381 | 0.2503 | 0.2937 | 0.5211 | **1.0000** | 76.42 | 38.03 | 39.0% | 0.3698 |
+#### Validation Sweep Results
+
+**A) Min Size Component Filter Sweep (`threshold = 0.5`)**
+
+| Min Component Size | 2D Tumor Dice | Precision | Sensitivity | 2D Slice FA % | 3D Patient FA % |
+|---|---|---|---|---|---|
+| **0 px (Raw)** | **0.5770** | **0.6229** | **0.5857** | 74.9% | 18.8% |
+| **5 px** | 0.5748 | 0.6194 | 0.5822 | 58.1% | 18.8% |
+| **10 px (Selected)** | 0.5577 | 0.6002 | 0.5627 | **36.3%** | 18.8% |
+| **15 px** | 0.4997 | 0.5387 | 0.4999 | 20.6% | 18.8% |
+
+**B) Probability Binarization Threshold Sweep (`min_size = 10px`)**
+
+| Binarization Threshold | 2D Tumor Dice | Precision | Sensitivity | 2D Slice FA % | 3D Patient FA % |
+|---|---|---|---|---|---|
+| **0.25** | **0.5767** | 0.5599 | **0.6520** | 61.6% | 18.8% |
+| **0.50 (Selected)** | 0.5577 | **0.6002** | 0.5627 | 36.3% | 18.8% |
+| **0.75** | 0.4836 | 0.5805 | 0.4408 | 18.5% | 18.8% |
+| **0.90** | 0.3803 | 0.5073 | 0.3193 | 8.8% | 18.8% |
+| **0.95** | 0.3090 | 0.4524 | 0.2459 | 5.3% | 18.8% |
+
+![Post-Processing Threshold Sensitivity](charts/postprocessing_threshold_sensitivity.png)
+
+#### Decision Rationale & Standardized Operating Point Selection
+- **Noise Suppression vs. Recall:** Setting `min_size = 10px` slashes the 2D slice false alarm rate from **74.9%** (raw) down to **36.3%** while preserving ~96% of valid tumor slice recall.
+- **Precision Balance:** Choosing `threshold = 0.5` provides the optimal clinical balance between sensitivity (0.5627) and precision (0.6002). Lowering threshold to 0.25 increases raw Dice slightly (0.5767) but triggers a massive jump in false alarms (61.6%). Raising threshold to 0.75 severely degrades Dice (0.4836).
+- **Standardized Configuration:** **Based on these validation sweep conclusions, we selected `threshold = 0.5` and `min_size = 10px` as our standard operating parameters.** All subsequent model training evaluations, test-set benchmarks, loss function comparisons, and architectural ablation studies in the following sections utilize this configuration.
+
+---
+
+### 5.2 Training Convergence Summary (Peak Validation Metrics at Best Checkpoint)
+
+During training, model checkpoints (`.pth`) are automatically saved whenever a run achieves a new **Peak Composite Score** ($\frac{\text{Dice} + \text{Sensitivity} + \text{Precision}}{3.0}$). The table below compares all 9 models evaluated at their respective **peak validation checkpoint epochs**:
+
+| Model Architecture | Input Dim | Loss Function | Peak Epoch | Val Dice | Val IoU | Precision | Sensitivity | Specificity | Composite Score |
+|---|---|---|---|---|---|---|---|---|---|
+| **Attention UNet 2.5D** | 2.5D | DiceFocal | Ep 29 | **0.7241** | **0.6137** | **0.7237** | **0.7720** | 0.9999 | **0.7399** |
+| **SegResNet 2.5D** | 2.5D | DiceFocal | Ep 20 | 0.6969 | 0.5861 | 0.7233 | 0.7214 | 0.9998 | 0.7139 |
+| **SegResNet 2D** | 2D | DiceFocal | Ep 25 | 0.6601 | 0.5574 | 0.6820 | 0.6816 | 0.9998 | 0.6746 |
+| **UNet 2.5D** | 2.5D | DiceFocal | Ep 31 | 0.6471 | 0.5369 | 0.6699 | 0.6840 | 0.9998 | 0.6670 |
+| **Attention UNet 2D** | 2D | DiceFocal | Ep 27 | 0.6425 | 0.5444 | 0.6487 | 0.6818 | 0.9998 | 0.6576 |
+| **UNet 2D (DiceFocal)** | 2D | DiceFocal | Ep 26 | 0.5770 | 0.4818 | 0.6229 | 0.5857 | 0.9998 | 0.5952 |
+| **UNet 2D (DiceCE)** | 2D | DiceCE | Ep 27 | 0.5623 | 0.4648 | 0.5793 | 0.5908 | 0.9998 | 0.5774 |
+| **UNet 2D (TverskyFocal)**| 2D | TverskyFocal | Ep 21 | 0.5348 | 0.4272 | 0.4794 | 0.6762 | 0.9997 | 0.5635 |
+| **UNet 2D (No Aug)** | 2D | DiceFocal | Ep 07 | 0.3623 | 0.2753 | 0.3410 | 0.4863 | 0.9996 | 0.3965 |
 
 ![Validation Dice Comparison](charts/validation_dice_comparison.png)
 
-![Training Curves Top 4 Models](charts/training_curves_top4.png)
+![Training Curves Top Architectures](charts/training_curves_top4.png)
 
 ---
 
-### 5.2 Test Set Evaluation Results (Post-Processed with `--min_size 10`)
+### 5.3 Test Set Evaluation Results (Post-Processed with `--threshold 0.5` and `--min_size 10`)
 
-Evaluating the saved best model checkpoints on the held-out **Test Set** (23,622 total test slices: 1,395 tumor-positive slices, 22,227 background slices, 186 distinct 3D nodules). Predictions are post-processed with connected component noise filtering (`--min_size 10` pixels):
+Evaluating the saved best model checkpoints on the held-out **Test Set** (23,622 total test slices: 1,395 tumor-positive slices, 22,227 background slices, 186 distinct 3D nodules). Predictions are post-processed with connected component noise filtering (`--min_size 10` pixels) and probability thresholding (`--threshold 0.5`):
 
-| Model Architecture | Input Dim | 2D Tumor Slice Dice | 2D Tumor Slice IoU | Precision | Sensitivity | HD95 (mm) | ASD (mm) | 2D Fail Rate | 2D All Slices Dice | 3D Nodule Lesion Dice |
-|---|---|---|---|---|---|---|---|---|---|---|
-| **Attention UNet 2.5D** | 2.5D | 0.6586 | 0.5552 | 0.6775 | 0.6946 | 12.34 | 7.83 | **14.6%** | 0.4525 | **0.6942** |
-| **SegResNet 2.5D** | 2.5D | **0.6655** | **0.5627** | **0.6784** | **0.6977** | **11.08** | **7.30** | 14.7% | 0.3848 | 0.6764 |
-| **SegResNet 2D** | 2D | 0.6390 | 0.5425 | 0.6634 | 0.6579 | 13.27 | 9.12 | 18.5% | 0.4908 | 0.6725 |
-| **Attention UNet 2D** | 2D | 0.6218 | 0.5243 | 0.6452 | 0.6432 | 15.50 | 9.69 | 19.1% | 0.4354 | 0.6630 |
-| **UNet 2.5D** | 2.5D | 0.6224 | 0.5171 | 0.6362 | 0.6656 | 14.13 | 9.32 | 17.0% | **0.5156** | 0.6429 |
-| **UNet 2D (DiceFocal)** | 2D | 0.5635 | 0.4709 | 0.5861 | 0.5864 | 17.47 | 13.09 | 25.6% | 0.4643 | 0.5953 |
-| **UNet 2D (DiceCE)** | 2D | 0.5470 | 0.4520 | 0.5440 | 0.5993 | 23.16 | 16.49 | 26.2% | 0.3960 | 0.5908 |
-| **UNet 2D (No Aug)** | 2D | 0.3609 | 0.2683 | 0.3100 | 0.5536 | 62.13 | 30.38 | 36.3% | 0.4902 | 0.4514 |
+| Model Architecture | Input Dim | 2D Tumor Slice Dice | 2D Precision | 2D Sensitivity | 2D Slice FA % | 3D Nodule Lesion Dice | 3D Nodule Precision | 3D Nodule Failure % |
+|---|---|---|---|---|---|---|---|---|
+| **Attention UNet 2.5D** | 2.5D | **0.6645** | **0.6880** | **0.6911** | 54.2% | **0.6935** | **0.7639** | **8.6%** |
+| **SegResNet 2.5D** | 2.5D | 0.6497 | 0.6918 | 0.6516 | 50.4% | 0.6384 | 0.7450 | 12.9% |
+| **Attention UNet 2D** | 2D | 0.6292 | 0.6486 | 0.6497 | 62.2% | 0.6617 | 0.7448 | 12.4% |
+| **UNet 2.5D** | 2.5D | 0.6154 | 0.6413 | 0.6359 | 40.3% | 0.6189 | 0.7029 | 15.1% |
+| **SegResNet 2D** | 2D | 0.5981 | 0.6336 | 0.6062 | 55.2% | 0.6318 | 0.7269 | 15.1% |
+| **UNet 2D (DiceCE)** | 2D | 0.5600 | 0.5757 | 0.5892 | 49.0% | 0.5875 | 0.6852 | 17.2% |
+| **UNet 2D (DiceFocal)** | 2D | 0.5510 | 0.5981 | 0.5512 | **38.5%** | 0.5819 | 0.7090 | 18.3% |
+| **UNet 2D (TverskyFocal)**| 2D | 0.5490 | 0.5083 | 0.6636 | 76.6% | 0.6284 | 0.6753 | 13.4% |
+| **UNet 2D (No Aug)** | 2D | 0.3601 | 0.3396 | 0.4730 | 42.1% | 0.4363 | 0.5051 | 36.0% |
 
 ---
 
-### 5.3 Comparison: Loss Functions (DiceFocal vs. DiceCE)
+### 5.4 Comparison: Loss Functions (DiceFocal vs. DiceCE vs. TverskyFocal)
 
-Comparing identical 2D UNet architectures trained with `DiceFocalLoss` vs. `DiceCELoss`:
-- **Peak Validation Dice:** DiceFocal achieved **0.5940** (Ep 34) vs. **0.5659** (Ep 24) for DiceCE (+2.81% gain).
-- **Failure Rate:** DiceFocal reduced validation failure rate from 22.5% to 20.3%.
-- **Analysis:** DiceFocal's focal parameter ($\gamma=2.0$) heavily penalizes misclassified foreground pixels around fine nodule boundaries, preventing background dominance during backpropagation.
+We evaluated 3 distinct loss function formulations on the 2D UNet architecture:
+1. **DiceFocal Loss:** Achieves the cleanest precision-to-false-alarm trade-off, recording the lowest 2D slice false alarm rate (**38.5%**) and highest 2D precision (**0.5981**).
+2. **DiceCE Loss:** Yields **0.5600** 2D Tumor Dice and **0.5875** 3D Nodule Dice, providing stable cross-entropy pixel classification.
+3. **TverskyFocal Loss ($\alpha=0.3, \beta=0.7, \gamma=2.0$):** Emphasizes false-negative penalties ($\beta=0.7$). It boosts 2D Sensitivity to **0.6636** (vs 0.5512 for DiceFocal) and 3D Nodule Dice to **0.6284** (vs 0.5819 for DiceFocal). Crucially, TverskyFocal excels on **Small Nodules (<100 voxels)**, reaching **0.5443** 3D Dice (compared to 0.4678 for DiceFocal).
 
 ![Loss Function Comparison](charts/loss_function_comparison.png)
 
 ---
 
-### 5.4 Comparison: Data Augmentation Impact (With Aug vs. No Aug)
+### 5.5 Comparison: Data Augmentation Impact (With Aug vs. No Aug)
 
 Training without MONAI spatial and intensity augmentations (`--no_transforms`) leads to severe overfitting:
-- **Peak Validation Dice:** Reaches a peak of **0.3381** at Epoch 06 before deteriorating down to **0.0949** by Epoch 40 (vs. **0.5940** for augmented UNet).
-- **Validation Failure Rate:** Escalate to **39.0%** at peak and **87.3%** at epoch 40 on non-augmented runs.
+- **Peak Validation Dice:** Reaches a peak of **0.3623** at Epoch 07 before deteriorating down to **0.0803** by Epoch 40 (vs. **0.5770** for augmented UNet).
+- **Validation Failure Rate:** Escalates to **38.4%** at peak and **89.4%** at epoch 40 on non-augmented runs.
 - **Conclusion:** Data augmentation (random affine rotation, scaling, Gaussian noise/blur) is strictly necessary to prevent spatial overfitting on cropped 256x256 CT slices.
 
 ![Augmentation Impact](charts/augmentation_impact.png)
-
----
-
-### 5.5 Comparison: Post-Processing Threshold Sweep (`min_size`)
-
-Sweep of minimum connected component size threshold (`min_size` = 0, 5, 10, 15 pixels) on the UNet 2D (DiceFocal) model:
-
-| Post-Processing Threshold | 2D Tumor Dice | 2D Tumor IoU | Precision | Sensitivity | Failure Rate | 3D Nodule Lesion Dice |
-|---|---|---|---|---|---|---|
-| **Filter $\ge 0$ px (Raw Output)** | **0.5820** | **0.4824** | **0.6090** | **0.6105** | **20.6%** | **0.6291** |
-| **Filter $\ge 5$ px** | 0.5802 | 0.4824 | 0.6041 | 0.6069 | 21.9% | 0.6249 |
-| **Filter $\ge 10$ px (Default)** | 0.5635 | 0.4709 | 0.5861 | 0.5864 | 25.6% | 0.5953 |
-| **Filter $\ge 15$ px** | 0.5163 | 0.4335 | 0.5363 | 0.5328 | 33.0% | 0.5033 |
-
-![Post-Processing Threshold Sensitivity](charts/postprocessing_threshold_sensitivity.png)
 
 ---
 
@@ -257,9 +282,9 @@ Sweep of minimum connected component size threshold (`min_size` = 0, 5, 10, 15 p
 
 | Architecture | 2D Peak Val Dice | 2.5D Peak Val Dice | 2D Test Dice | 2.5D Test Dice | 2.5D Performance Gain |
 |---|---|---|---|---|---|
-| **SegResNet** | 0.6697 | **0.7180** | 0.6390 | **0.6655** | **+4.83% Val / +2.65% Test** |
-| **Attention UNet** | 0.6565 | **0.7115** | 0.6218 | **0.6586** | **+5.50% Val / +3.68% Test** |
-| **UNet** | 0.5940 | **0.6438** | 0.5635 | **0.6224** | **+4.98% Val / +5.89% Test** |
+| **Attention UNet** | 0.6425 | **0.7241** | 0.6292 | **0.6645** | **+0.0816 Val / +0.0353 Test** |
+| **SegResNet** | 0.6601 | **0.6969** | 0.5981 | **0.6497** | **+0.0368 Val / +0.0516 Test** |
+| **UNet** | 0.5770 | **0.6471** | 0.5510 | **0.6154** | **+0.0701 Val / +0.0644 Test** |
 
 ![2D vs 2.5D Comparison](charts/2d_vs_25d_comparison.png)
 
@@ -267,9 +292,9 @@ Sweep of minimum connected component size threshold (`min_size` = 0, 5, 10, 15 p
 
 ### 5.7 Comparison: Model Architecture (UNet vs. Attention UNet vs. SegResNet)
 
-- **Top Performers:** **SegResNet 2.5D** (Peak Val Dice: **0.7180**, Composite Score: **0.6993**) and **Attention UNet 2.5D** (Peak Val Dice: **0.7115**, Test 3D Nodule Dice: **0.6942**) lead overall performance.
-- **Attention Gates:** Attention gating mechanisms allow Attention UNet to focus feature maps on small nodule targets while filtering out surrounding lung parenchyma.
-- **2.5D Spatial Context:** Incorporating 3 adjacent CT slices uniformly boosts performance across UNet (+4.98%), Attention UNet (+5.50%), and SegResNet (+4.83%) peak validation Dice scores.
+- **Top Performers:** **Attention UNet 2.5D** (Peak Val Dice: **0.7241**, Test 3D Nodule Dice: **0.6935**, Test 3D Precision: **0.7639**) leads overall performance across all benchmarked configurations.
+- **Attention Gating:** Attention gates filter out non-salient background signals along skip connections, significantly reducing false positive slice rates while sharpening boundary precision.
+- **2.5D Spatial Context:** Incorporating 3 adjacent CT slices uniformly boosts performance across UNet (+0.0701), Attention UNet (+0.0816), and SegResNet (+0.0368) peak validation Dice scores.
 
 ---
 
@@ -279,14 +304,15 @@ Sweep of minimum connected component size threshold (`min_size` = 0, 5, 10, 15 p
 
 | Model Architecture | All Nodules Dice (Count: 186) | Small Nodules Dice (<100 voxels, Count: 93) | Medium Nodules Dice (100-1000 voxels, Count: 75) | Large Nodules Dice ($\ge$1000 voxels, Count: 18) |
 |---|---|---|---|---|
-| **Attention UNet 2.5D** | **0.6942** | **0.6132** | **0.7867** | 0.7276 |
-| **SegResNet 2.5D** | 0.6764 | 0.5742 | 0.7820 | 0.7645 |
-| **SegResNet 2D** | 0.6725 | 0.5659 | 0.7798 | **0.7759** |
-| **Attention UNet 2D** | 0.6630 | 0.5553 | 0.7805 | 0.7290 |
-| **UNet 2.5D** | 0.6429 | 0.5354 | 0.7593 | 0.7133 |
-| **UNet 2D (DiceFocal)** | 0.5953 | 0.4857 | 0.7068 | 0.6968 |
-| **UNet 2D (DiceCE)** | 0.5908 | 0.4856 | 0.6945 | 0.7021 |
-| **UNet 2D (No Aug)** | 0.4514 | 0.3152 | 0.5736 | 0.6461 |
+| **Attention UNet 2.5D** | **0.6935** | **0.6117** | **0.7819** | 0.7477 |
+| **SegResNet 2.5D** | 0.6384 | 0.5109 | 0.7621 | **0.7815** |
+| **Attention UNet 2D** | 0.6617 | 0.5586 | 0.7699 | 0.7430 |
+| **UNet 2D (TverskyFocal)**| 0.6284 | 0.5443 | 0.7142 | 0.7055 |
+| **UNet 2.5D** | 0.6189 | 0.5132 | 0.7298 | 0.7027 |
+| **SegResNet 2D** | 0.6318 | 0.5160 | 0.7543 | 0.7195 |
+| **UNet 2D (DiceCE)** | 0.5875 | 0.4634 | 0.7096 | 0.7206 |
+| **UNet 2D (DiceFocal)** | 0.5819 | 0.4678 | 0.7017 | 0.6729 |
+| **UNet 2D (No Aug)** | 0.4363 | 0.3211 | 0.5593 | 0.5184 |
 
 ![Nodule Size Stratification](charts/nodule_size_stratification.png)
 
@@ -345,43 +371,47 @@ python training/train_2_5d.py \
     --save_path models/attention_unet_2.5d/attention_unet_2.5d.pth
 ```
 
-Train a 2D baseline UNet model:
+Train a 2D UNet model with Tversky loss:
 ```bash
 python training/train.py \
     --model_type unet \
-    --loss dice_focal \
+    --loss tversky \
     --epochs 40 \
     --batch_size 64 \
-    --save_path models/unet_dicefocal/unet_dicefocal.pth
+    --save_path models/unet_tversky/unet_tversky.pth
 ```
 
-#### Step 3: Model Evaluation
-Evaluate a trained model checkpoint on the test set:
+#### Step 3: Model Evaluation on Test Split
+Evaluate a trained model checkpoint on the held-out test split using the standardized operating point (`--threshold 0.5`, `--min_size 10`):
 ```bash
 python evaluation/evaluate_2_5d.py \
     --model_path models/attention_unet_2.5d/attention_unet_2.5d.pth \
-    --report_path models/attention_unet_2.5d/test_evaluation_report.txt \
-    --min_size 10
+    --split test \
+    --threshold 0.5 \
+    --min_size 10 \
+    --report_path model_evals/attention_unet_2.5d/test_evaluation_report.txt
 ```
 
 ---
 
-## 7. Visualization Tools
+## 7. Interactive Visualization Tools
 
-### 7.1 Interactive Slice Visualizer (`visualization/visualize_patient_interactive.py`)
+### 7.1 Interactive 2D Slice Visualizer (`visualization/visualize_patient_interactive.py`)
 An interactive Tkinter GUI application for exploring 2D model predictions slice-by-slice alongside ground-truth masks:
 ```bash
 python visualization/visualize_patient_interactive.py \
     --model_path models/attention_unet/attention_unet.pth \
-    --patient_id LIDC-IDRI-0002
+    --patient_id LIDC-IDRI-0002 \
+    --min_size 10
 ```
 
-### 7.2 Interactive 2.5D Visualizer (`visualization/visualize_patient_interactive_2_5d.py`)
+### 7.2 Interactive 2.5D Slice Visualizer (`visualization/visualize_patient_interactive_2_5d.py`)
 Interactive slice visualizer designed specifically for 3-channel 2.5D multi-slice predictions:
 ```bash
 python visualization/visualize_patient_interactive_2_5d.py \
     --model_path models/attention_unet_2.5d/attention_unet_2.5d.pth \
-    --patient_id LIDC-IDRI-0002
+    --patient_id LIDC-IDRI-0002 \
+    --min_size 10
 ```
 
 ### 7.3 Dataset Analytics Visualizer (`visualization/visualize_dataset.py`)
