@@ -17,7 +17,7 @@ from matplotlib.path import Path
 from matplotlib.widgets import Slider, Button, RadioButtons, CheckButtons
 
 # Default Configuration Constants
-DEFAULT_DATASET_DIR = "dataset"
+DEFAULT_DATASET_DIR = "/mnt/hdd/CS2023-2027/AIMAS/practica/datasetmare"
 DEFAULT_PATIENT_ID = "LIDC-IDRI-0001"
 
 def build_xml_index(datasetmare_dir):
@@ -504,15 +504,18 @@ def list_lidc_patients(datasetmare_dir="datasetmare"):
 def main():
     parser = argparse.ArgumentParser(description="Visualize LIDC-IDRI DICOM CT Scans and Expert Radiologist XML Annotations")
     parser.add_argument("--patient", "-p", type=str, default=DEFAULT_PATIENT_ID, help=f"Patient ID (default: {DEFAULT_PATIENT_ID})")
+    parser.add_argument("--dataset_dir", "-d", type=str, default=DEFAULT_DATASET_DIR, help=f"Path to dataset directory (default: {DEFAULT_DATASET_DIR})")
     parser.add_argument("--save", "-s", action="store_true", help="Save multi-view grid preview PNG image to disk")
     parser.add_argument("--out", "-o", type=str, default=None, help="Output image file path")
     parser.add_argument("--list", "-l", action="store_true", help="List all available patients in datasetmare")
     args = parser.parse_args()
 
-    base_dir = os.path.dirname(os.path.abspath(__file__))
-    datasetmare_dir = os.path.join(base_dir, DEFAULT_DATASET_DIR)
+    datasetmare_dir = args.dataset_dir
     if not os.path.exists(datasetmare_dir):
-        datasetmare_dir = DEFAULT_DATASET_DIR
+        base_dir = os.path.dirname(os.path.abspath(__file__))
+        alt_dir = os.path.join(base_dir, DEFAULT_DATASET_DIR)
+        if os.path.exists(alt_dir):
+            datasetmare_dir = alt_dir
 
     if args.list:
         list_lidc_patients(datasetmare_dir)

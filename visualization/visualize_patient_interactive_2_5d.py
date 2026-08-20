@@ -27,7 +27,12 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 from matplotlib.widgets import Button
+import inspect
 from scipy.ndimage import label
+
+# Local imports
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+from training.train_2_5d import get_model
 
 # Default Configuration Constants
 DEFAULT_PATIENT_ID = "LIDC-IDRI-0035"
@@ -106,36 +111,40 @@ def load_trained_model(model_path, device):
 
     print(f"Loading trained 2.5D MONAI model from {model_path}...")
     checkpoint = torch.load(model_path, map_location=device)
-    state_dict = checkpoint["model_state_dict"]
+    state_dict = checkpoint.get("model_state_dict", checkpoint)
 
-    if "model_kwargs" in checkpoint:
-        model_kwargs = checkpoint["model_kwargs"]
-    else:
-        first_layer_key = [k for k in state_dict.keys() if "weight" in k][0]
-        base = state_dict[first_layer_key].shape[0]
-        model_kwargs = {
-            "spatial_dims": 2,
-            "in_channels": 3,
-            "out_channels": 1,
-            "channels": tuple(base * (2**i) for i in range(5)),
-            "strides": (2, 2, 2, 2),
-            "num_res_units": 2
-        }
-
-    # Dynamically detect UNet vs AttentionUnet vs SegResNet architecture from checkpoint weights
-    try:
-        model = UNet(**model_kwargs).to(device)
-        model.load_state_dict(state_dict)
-    except Exception:
+    if "model_type" in checkpoint:
         try:
-            model = AttentionUnet(**model_kwargs).to(device)
+            model, _ = get_model(checkpoint["model_type"], in_channels=3)
             model.load_state_dict(state_dict)
+            model.eval()
+            return model.to(device)
         except Exception:
-            model = SegResNet(**model_kwargs).to(device)
-            model.load_state_dict(state_dict)
+            pass
 
-    model.eval()
-    return model
+    if "model_kwargs" in checkpoint and isinstance(checkpoint["model_kwargs"], dict):
+        kwargs = checkpoint["model_kwargs"].copy()
+        for model_cls in [UNet, AttentionUnet, SegResNet]:
+            try:
+                valid_params = inspect.signature(model_cls.__init__).parameters.keys()
+                filtered = {k: v for k, v in kwargs.items() if k in valid_params}
+                model = model_cls(**filtered)
+                model.load_state_dict(state_dict)
+                model.eval()
+                return model.to(device)
+            except Exception:
+                continue
+
+    for m_type in ["unet", "attention_unet", "segresnet"]:
+        try:
+            model, _ = get_model(m_type, in_channels=3)
+            model.load_state_dict(state_dict)
+            model.eval()
+            return model.to(device)
+        except Exception:
+            continue
+
+    raise RuntimeError(f"Failed to load checkpoint from {model_path} into any supported 2.5D architecture.")
 
 
 class PatientSliceVisualizer25D:
