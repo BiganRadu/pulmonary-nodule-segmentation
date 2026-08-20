@@ -123,7 +123,7 @@ Training is performed using `training/train.py` for 2D single-slice models and `
 ### 3.2 Loss Function Formulations
 - **`dice_focal`** (Default): `DiceFocalLoss(sigmoid=True, squared_pred=True, gamma=2.0)`. Blends Dice overlap optimization with Focal Loss to focus gradients on hard-to-classify boundary pixels.
 - **`dice_ce`**: `DiceCELoss(sigmoid=True, squared_pred=True)`. Combines soft Dice loss with Binary Cross-Entropy.
-- **`tversky`**: `TverskyCELoss`. A hybrid loss combining Tversky loss ($\alpha=0.3, \beta=0.7$) with BCE. Penalizes false negatives (missed nodules) more strictly than false positives.
+- **`tversky` / `focal_tversky`**: `FocalTverskyLoss` ($\alpha=0.3, \beta=0.7, \gamma=0.75$). Implements Abraham & Khan (2019) Focal Tversky Loss. Higher $\beta=0.7$ penalizes false negatives (missed nodules) to boost sensitivity, while the focal exponent $\gamma=0.75$ keeps gradients large for hard-to-segment examples.
 
 ### 3.3 Training Hyperparameters
 
@@ -178,7 +178,7 @@ We benchmarked **8 model configurations** across 40 epochs. All evaluation exper
 
 ### 5.1 Training Convergence Summary (Peak Validation Metrics at Best Checkpoint)
 
-During training, model checkpoints (`.pth`) are automatically saved whenever a run achieves a new **Peak Composite Score** ($\frac{\text{Dice} + \text{IoU} + \text{Sensitivity}}{3.0}$). The table below compares all 8 models evaluated at their respective **peak validation checkpoint epochs**:
+During training, model checkpoints (`.pth`) are automatically saved whenever a run achieves a new **Peak Composite Score** ($\frac{\text{Dice} + \text{Sensitivity} + \text{Precision}}{3.0}$). The table below compares all 8 models evaluated at their respective **peak validation checkpoint epochs**:
 
 | Model Architecture | Input Dim | Loss Function | Peak Epoch | Val Dice | Val IoU | Precision | Sensitivity | Specificity | HD95 (mm) | ASD (mm) | Fail Rate | Composite Score |
 |---|---|---|---|---|---|---|---|---|---|---|---|---|
