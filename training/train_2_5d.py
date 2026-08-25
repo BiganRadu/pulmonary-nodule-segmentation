@@ -228,7 +228,10 @@ class LIDC25DDataset(Dataset):
         if self.split == "train":
             self.resample_epoch(epoch=1)
         else:
-            self.data_entries = self.full_split_df
+            if self.neg_ratio <= 0:
+                self.data_entries = self.full_split_df[self.full_split_df["has_tumor"] == 1].reset_index(drop=True)
+            else:
+                self.data_entries = self.full_split_df
 
     def resample_epoch(self, epoch=1):
         """
@@ -247,16 +250,17 @@ class LIDC25DDataset(Dataset):
             if num_pos > 0:
                 target_neg_count = int(np.ceil(self.neg_ratio * num_pos))
             else:
-                target_neg_count = min(len(neg_df), 20)
+                target_neg_count = 0 if self.neg_ratio <= 0 else min(len(neg_df), 20)
 
-            if len(neg_df) > 0:
+            if len(neg_df) > 0 and target_neg_count > 0:
                 sampled_neg_indices = np.random.choice(len(neg_df), size=min(len(neg_df), target_neg_count), replace=False)
                 sampled_neg_df = neg_df.iloc[sampled_neg_indices]
             else:
-                sampled_neg_df = neg_df
+                sampled_neg_df = neg_df.iloc[0:0]
 
             combined_p_df = pd.concat([pos_df, sampled_neg_df]).sort_values("slice_idx")
-            patient_sampled_list.append(combined_p_df)
+            if len(combined_p_df) > 0:
+                patient_sampled_list.append(combined_p_df)
 
         self.data_entries = pd.concat(patient_sampled_list).sort_values(by=["patient_id", "slice_idx"]).reset_index(drop=True)
 
@@ -669,7 +673,7 @@ def main():
     train_transforms, val_transforms = get_transforms(no_augmentations=args.no_transforms)
 
     train_dataset = LIDC25DDataset(args.manifest, split="train", transform=train_transforms, neg_ratio=args.neg_ratio, seed=args.seed)
-    val_dataset = LIDC25DDataset(args.manifest, split="val", transform=val_transforms, seed=args.seed)
+    val_dataset = LIDC25DDataset(args.manifest, split="val", transform=val_transforms, neg_ratio=args.neg_ratio, seed=args.seed)
 
     train_loader = DataLoader(
         train_dataset,
