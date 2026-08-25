@@ -45,7 +45,6 @@ DEFAULT_SPLIT = "test"
 DEFAULT_BATCH_SIZE = 32
 DEFAULT_NUM_WORKERS = 8
 DEFAULT_MIN_VOXELS_3D = 15
-DEFAULT_MIN_CONSECUTIVE_SLICES = 1
 DEFAULT_MIN_PEAK_PROB = 0.0
 DEFAULT_REPORT_PATH = "models/attention_unet_2.5d/test_evaluation_report.txt"
 DEFAULT_THRESHOLD = 0.5
@@ -66,12 +65,10 @@ def set_seed(seed=42):
     monai.utils.set_determinism(seed=seed)
 
 
-def remove_small_objects_3d(vol_binary, min_voxels=15, min_consecutive_slices=1,
-                            vol_prob=None, min_peak_prob=0.0):
+def remove_small_objects_3d(vol_binary, min_voxels=15, vol_prob=None, min_peak_prob=0.0):
     """
     Applies 3D connected-component labeling on full 3D CT volume (26-connectivity).
     - Removes 3D components with volume < min_voxels.
-    - If min_consecutive_slices > 1: removes 3D components spanning fewer than min_consecutive_slices axial slices.
     - If min_peak_prob > 0 (and vol_prob is supplied): removes 3D components whose PEAK sigmoid
       probability never reaches min_peak_prob.
 
@@ -85,8 +82,8 @@ def remove_small_objects_3d(vol_binary, min_voxels=15, min_consecutive_slices=1,
 
     use_peak_gate = (min_peak_prob > 0.0 and vol_prob is not None)
 
-    # Step 1: 3D Connected-Component Size, Slice-Span & Peak-Confidence Filtering
-    if min_voxels > 0 or min_consecutive_slices > 1 or use_peak_gate:
+    # Step 1: 3D Connected-Component Size & Peak-Confidence Filtering
+    if min_voxels > 0 or use_peak_gate:
         labeled_mask, num_features = label(vol_binary, structure=np.ones((3, 3, 3), dtype=bool))
         if num_features == 0:
             return vol_binary
@@ -95,14 +92,6 @@ def remove_small_objects_3d(vol_binary, min_voxels=15, min_consecutive_slices=1,
 
         if min_voxels > 0:
             too_small |= (component_sizes < min_voxels)
-
-        if min_consecutive_slices > 1:
-            objects = find_objects(labeled_mask)
-            for idx, bbox in enumerate(objects, start=1):
-                if bbox is not None:
-                    z_span = bbox[2].stop - bbox[2].start
-                    if z_span < min_consecutive_slices:
-                        too_small[idx] = True
 
         if use_peak_gate:
             # Per-component max over foreground voxels only (labeled_mask is 0 elsewhere)
@@ -280,7 +269,7 @@ def load_trained_model(model_path, device, in_channels=3):
     raise RuntimeError(f"Failed to load checkpoint from {model_path} into any supported 2.5D architecture.")
 
 
-def evaluate_test_set_hierarchical(model, loader, device, min_voxels_3d=15, min_consecutive_slices=1,
+def evaluate_test_set_hierarchical(model, loader, device, min_voxels_3d=15,
                                    threshold=0.5, min_peak_prob=0.0):
     model.eval()
 
@@ -312,12 +301,11 @@ def evaluate_test_set_hierarchical(model, loader, device, min_voxels_3d=15, min_
         vol_pred = vol_prob > threshold
         vol_gt = np.stack([current_patient_gts[k] for k in s_keys], axis=-1)
 
-        # Apply 3D Volumetric Connected-Component Filtering + Slice-Span + Peak-Confidence Gate
-        if (min_voxels_3d > 0 or min_consecutive_slices > 1 or min_peak_prob > 0.0) and np.sum(vol_pred) > 0:
+        # Apply 3D Volumetric Connected-Component Filtering + Peak-Confidence Gate
+        if (min_voxels_3d > 0 or min_peak_prob > 0.0) and np.sum(vol_pred) > 0:
             vol_pred = remove_small_objects_3d(
                 vol_pred,
                 min_voxels=min_voxels_3d,
-                min_consecutive_slices=min_consecutive_slices,
                 vol_prob=vol_prob,
                 min_peak_prob=min_peak_prob
             )
@@ -397,8 +385,6 @@ def evaluate_test_set_hierarchical(model, loader, device, min_voxels_3d=15, min_
         current_patient_gts.clear()
 
     filter_parts = [f"≥{min_voxels_3d} voxels"]
-    if min_consecutive_slices > 1:
-        filter_parts.append(f"≥{min_consecutive_slices} slices")
     if min_peak_prob > 0.0:
         filter_parts.append(f"peak ≥{min_peak_prob:g}")
     filter_desc = ", ".join(filter_parts)
@@ -459,11 +445,9 @@ def evaluate_test_set_hierarchical(model, loader, device, min_voxels_3d=15, min_
     return results
 
 
-def print_and_format_report(results, min_voxels_3d, report_path, min_consecutive_slices=1,
+def print_and_format_report(results, min_voxels_3d, report_path,
                             threshold=0.5, min_peak_prob=0.0):
     filter_parts = [f"≥{min_voxels_3d} voxels"]
-    if min_consecutive_slices > 1:
-        filter_parts.append(f"≥{min_consecutive_slices} slices")
     if min_peak_prob > 0.0:
         filter_parts.append(f"peak ≥{min_peak_prob:g}")
     filter_desc = ", ".join(filter_parts)
@@ -546,7 +530,6 @@ def main():
     parser.add_argument("--batch_size", type=int, default=DEFAULT_BATCH_SIZE, help=f"Batch size for evaluation (default: {DEFAULT_BATCH_SIZE})")
     parser.add_argument("--num_workers", type=int, default=DEFAULT_NUM_WORKERS, help=f"DataLoader num_workers (default: {DEFAULT_NUM_WORKERS})")
     parser.add_argument("--min_voxels_3d", "--min_voxels", "--min_size", type=int, default=DEFAULT_MIN_VOXELS_3D, help=f"Minimum 3D connected component volume in voxels (default: {DEFAULT_MIN_VOXELS_3D})")
-    parser.add_argument("--min_consecutive_slices", "--min_slices", "--min_z_slices", type=int, default=DEFAULT_MIN_CONSECUTIVE_SLICES, help=f"Minimum consecutive Z-slices a 3D component must span (default: {DEFAULT_MIN_CONSECUTIVE_SLICES})")
     parser.add_argument("--min_peak_prob", "--peak_gate", type=float, default=DEFAULT_MIN_PEAK_PROB, help=f"Keep a 3D connected component only if its peak sigmoid probability reaches this value. Applied to whole components, so it deletes low-confidence blobs without eroding nodule boundaries. 0 disables the gate (default: {DEFAULT_MIN_PEAK_PROB})")
     parser.add_argument("--threshold", type=float, default=DEFAULT_THRESHOLD, help=f"Probability threshold for binarizing predictions (default: {DEFAULT_THRESHOLD})")
     parser.add_argument("--report_path", type=str, default=DEFAULT_REPORT_PATH, help=f"Output report text path (default: {DEFAULT_REPORT_PATH})")
@@ -578,7 +561,6 @@ def main():
         eval_loader,
         device,
         min_voxels_3d=args.min_voxels_3d,
-        min_consecutive_slices=args.min_consecutive_slices,
         threshold=args.threshold,
         min_peak_prob=args.min_peak_prob
     )
@@ -587,7 +569,6 @@ def main():
         results,
         min_voxels_3d=args.min_voxels_3d,
         report_path=args.report_path,
-        min_consecutive_slices=args.min_consecutive_slices,
         threshold=args.threshold,
         min_peak_prob=args.min_peak_prob
     )
