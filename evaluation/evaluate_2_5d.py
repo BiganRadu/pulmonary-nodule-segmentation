@@ -44,7 +44,9 @@ DEFAULT_MODEL_PATH = "models/attention_unet_2.5d/attention_unet_2.5d.pth"
 DEFAULT_SPLIT = "test"
 DEFAULT_BATCH_SIZE = 32
 DEFAULT_NUM_WORKERS = 8
-DEFAULT_MIN_SIZE = 10
+DEFAULT_MIN_VOXELS_3D = 15
+DEFAULT_MIN_CONSECUTIVE_SLICES = 1
+DEFAULT_MIN_PEAK_PROB = 0.0
 DEFAULT_REPORT_PATH = "models/attention_unet_2.5d/test_evaluation_report.txt"
 DEFAULT_THRESHOLD = 0.5
 DEFAULT_SEED = 42
@@ -64,18 +66,59 @@ def set_seed(seed=42):
     monai.utils.set_determinism(seed=seed)
 
 
-def remove_small_objects(binary_mask, min_size):
-    if min_size <= 0 or np.sum(binary_mask) == 0:
-        return binary_mask
-    labeled_mask, num_features = label(binary_mask)
-    if num_features == 0:
-        return binary_mask
-    component_sizes = np.bincount(labeled_mask.ravel())
-    too_small = component_sizes < min_size
-    too_small[0] = False
-    cleaned_mask = binary_mask.copy()
-    cleaned_mask[too_small[labeled_mask]] = 0
-    return cleaned_mask
+def remove_small_objects_3d(vol_binary, min_voxels=15, min_consecutive_slices=1,
+                            vol_prob=None, min_peak_prob=0.0):
+    """
+    Applies 3D connected-component labeling on full 3D CT volume (26-connectivity).
+    - Removes 3D components with volume < min_voxels.
+    - If min_consecutive_slices > 1: removes 3D components spanning fewer than min_consecutive_slices axial slices.
+    - If min_peak_prob > 0 (and vol_prob is supplied): removes 3D components whose PEAK sigmoid
+      probability never reaches min_peak_prob.
+
+    The peak-probability gate is a detection decision applied to whole components, kept separate
+    from the pixel binarization threshold, which is a segmentation decision. This lets a low pixel
+    threshold preserve nodule boundaries while low-confidence vessel/fissure blobs are deleted
+    outright rather than eroded.
+    """
+    if np.sum(vol_binary) == 0:
+        return vol_binary
+
+    use_peak_gate = (min_peak_prob > 0.0 and vol_prob is not None)
+
+    # Step 1: 3D Connected-Component Size, Slice-Span & Peak-Confidence Filtering
+    if min_voxels > 0 or min_consecutive_slices > 1 or use_peak_gate:
+        labeled_mask, num_features = label(vol_binary, structure=np.ones((3, 3, 3), dtype=bool))
+        if num_features == 0:
+            return vol_binary
+        component_sizes = np.bincount(labeled_mask.ravel(), minlength=num_features + 1)
+        too_small = np.zeros(num_features + 1, dtype=bool)
+
+        if min_voxels > 0:
+            too_small |= (component_sizes < min_voxels)
+
+        if min_consecutive_slices > 1:
+            objects = find_objects(labeled_mask)
+            for idx, bbox in enumerate(objects, start=1):
+                if bbox is not None:
+                    z_span = bbox[2].stop - bbox[2].start
+                    if z_span < min_consecutive_slices:
+                        too_small[idx] = True
+
+        if use_peak_gate:
+            # Per-component max over foreground voxels only (labeled_mask is 0 elsewhere)
+            flat_labels = labeled_mask.ravel()
+            fg = np.flatnonzero(flat_labels)
+            comp_peak = np.zeros(num_features + 1, dtype=np.float32)
+            np.maximum.at(comp_peak, flat_labels[fg], vol_prob.ravel()[fg].astype(np.float32))
+            too_small |= (comp_peak < min_peak_prob)
+
+        too_small[0] = False  # Ensure background is never removed
+        cleaned_vol = vol_binary.copy()
+        cleaned_vol[too_small[labeled_mask]] = False
+    else:
+        cleaned_vol = vol_binary.copy()
+
+    return cleaned_vol
 
 
 def compute_surface_distances(pred_binary, gt_binary, spacing=None):
@@ -237,61 +280,12 @@ def load_trained_model(model_path, device, in_channels=3):
     raise RuntimeError(f"Failed to load checkpoint from {model_path} into any supported 2.5D architecture.")
 
 
-def evaluate_test_set_hierarchical(model, loader, device, min_size, threshold=0.5):
+def evaluate_test_set_hierarchical(model, loader, device, min_voxels_3d=15, min_consecutive_slices=1,
+                                   threshold=0.5, min_peak_prob=0.0):
     model.eval()
-
-    patient_3d_preds = {}
-    patient_3d_gts = {}
-    patient_cropped_shapes = {}  # Cache per-patient cropped_shape for spacing computation
 
     slice_metrics_all = []
     slice_metrics_pos = []
-
-    print(f"\nRunning Comprehensive Evaluation on 2.5D Test Set (Component filter ≥{min_size}px, Threshold: {threshold})...")
-
-    with torch.no_grad():
-        for batch in tqdm(loader, desc="[Evaluating Test Slices]"):
-            images, masks, pids, s_idxs = batch[0], batch[1], batch[2], batch[3]
-            cropped_shapes = batch[4]  # list of [H, W, Z] per sample
-            images = images.to(device, non_blocking=True)
-            masks = masks.to(device, non_blocking=True)
-
-            if device.type == "cuda":
-                with torch.amp.autocast('cuda'):
-                    outputs = model(images)
-            else:
-                outputs = model(images)
-
-            preds_raw = (torch.sigmoid(outputs) > threshold).float()
-
-            preds_np = preds_raw.cpu().numpy()
-            masks_np = masks.cpu().numpy()
-
-            for b in range(preds_np.shape[0]):
-                p_mask = preds_np[b, 0]
-                g_mask = masks_np[b, 0]
-                pid = pids[b]
-                s_idx = int(s_idxs[b]) if not isinstance(s_idxs[b], int) else s_idxs[b]
-
-                # Compute per-patient 2D spacing in mm
-                cs_h = float(cropped_shapes[0][b])
-                cs_w = float(cropped_shapes[1][b])
-                spacing_2d = (cs_h / 256.0, cs_w / 256.0)
-
-                if min_size > 0:
-                    p_mask = remove_small_objects(p_mask, min_size=min_size)
-
-                if pid not in patient_3d_preds:
-                    patient_3d_preds[pid] = {}
-                    patient_3d_gts[pid] = {}
-                    patient_cropped_shapes[pid] = (cs_h, cs_w)
-                patient_3d_preds[pid][s_idx] = p_mask
-                patient_3d_gts[pid][s_idx] = g_mask
-
-                m_slice = compute_single_mask_metrics(p_mask, g_mask, spacing=spacing_2d)
-                slice_metrics_all.append(m_slice)
-                if not m_slice["is_empty_gt"]:
-                    slice_metrics_pos.append(m_slice)
 
     patient_metrics_all = []
     patient_metrics_pos = []
@@ -302,41 +296,66 @@ def evaluate_test_set_hierarchical(model, loader, device, min_size, threshold=0.
     nodule_metrics_medium = []
     nodule_metrics_large = []
 
-    for pid in tqdm(sorted(patient_3d_preds.keys()), desc="[3D Patient & Nodule Reconstruction]"):
-        s_keys = sorted(patient_3d_preds[pid].keys())
-        vol_pred = np.stack([patient_3d_preds[pid][k] for k in s_keys], axis=-1)
-        vol_gt = np.stack([patient_3d_gts[pid][k] for k in s_keys], axis=-1)
+    current_pid = None
+    current_patient_preds = {}
+    current_patient_gts = {}
+    current_cropped_shape = (256.0, 256.0)
 
-        # 3D spacing: X/Y from crop resize, Z = 1mm (stacked slices at 1mm isotropic)
-        cs_h, cs_w = patient_cropped_shapes[pid]
+    def finalize_current_patient():
+        nonlocal current_pid, current_patient_preds, current_patient_gts, current_cropped_shape
+        if current_pid is None or not current_patient_preds:
+            return
+
+        s_keys = sorted(current_patient_preds.keys())
+        # current_patient_preds holds raw sigmoid probabilities; binarize once the volume is assembled
+        vol_prob = np.stack([current_patient_preds[k] for k in s_keys], axis=-1)
+        vol_pred = vol_prob > threshold
+        vol_gt = np.stack([current_patient_gts[k] for k in s_keys], axis=-1)
+
+        # Apply 3D Volumetric Connected-Component Filtering + Slice-Span + Peak-Confidence Gate
+        if (min_voxels_3d > 0 or min_consecutive_slices > 1 or min_peak_prob > 0.0) and np.sum(vol_pred) > 0:
+            vol_pred = remove_small_objects_3d(
+                vol_pred,
+                min_voxels=min_voxels_3d,
+                min_consecutive_slices=min_consecutive_slices,
+                vol_prob=vol_prob,
+                min_peak_prob=min_peak_prob
+            )
+
+        cs_h, cs_w = current_cropped_shape
         spacing_3d = (cs_h / 256.0, cs_w / 256.0, 1.0)
-        spacing_2d_patient = (cs_h / 256.0, cs_w / 256.0)
+        spacing_2d = (cs_h / 256.0, cs_w / 256.0)
 
+        # 1. 3D Patient Volumetric Metrics
         m_patient = compute_single_mask_metrics(vol_pred, vol_gt, spacing=spacing_3d)
         patient_metrics_all.append(m_patient)
         if not m_patient["is_empty_gt"]:
             patient_metrics_pos.append(m_patient)
 
+        # 2. 2D Per-Slice Metrics from 3D-filtered Volume
         patient_2d_tumor_metrics = []
         patient_2d_all_metrics = []
         has_tumor_scan = (np.sum(vol_gt) > 0)
         num_tumor_slices = 0
 
-        for k in s_keys:
-            p_slice = patient_3d_preds[pid][k]
-            g_slice = patient_3d_gts[pid][k]
-            m_2d = compute_single_mask_metrics(p_slice, g_slice, spacing=spacing_2d_patient)
-            patient_2d_all_metrics.append(m_2d)
+        for z_i, k in enumerate(s_keys):
+            p_slice = vol_pred[:, :, z_i]
+            g_slice = vol_gt[:, :, z_i]
+
+            m_slice = compute_single_mask_metrics(p_slice, g_slice, spacing=spacing_2d)
+            slice_metrics_all.append(m_slice)
+            patient_2d_all_metrics.append(m_slice)
 
             if np.sum(g_slice) > 0:
                 num_tumor_slices += 1
-                patient_2d_tumor_metrics.append(m_2d)
+                slice_metrics_pos.append(m_slice)
+                patient_2d_tumor_metrics.append(m_slice)
 
         agg_tumor_2d = aggregate_metric_dict(patient_2d_tumor_metrics)
         agg_all_2d = aggregate_metric_dict(patient_2d_all_metrics)
 
         per_patient_rows.append({
-            "patient_id": pid,
+            "patient_id": current_pid,
             "total_slices": len(s_keys),
             "tumor_slices": num_tumor_slices,
             "has_tumor": 1 if has_tumor_scan else 0,
@@ -351,7 +370,8 @@ def evaluate_test_set_hierarchical(model, loader, device, min_size, threshold=0.
             "dice_3d_vol": m_patient["dice"]
         })
 
-        if np.sum(vol_gt) > 0:
+        # 3. 3D Nodule Lesion Extraction & Stratification
+        if has_tumor_scan:
             labeled_gt, num_nodules = label(vol_gt > 0)
             slices = find_objects(labeled_gt)
 
@@ -372,6 +392,56 @@ def evaluate_test_set_hierarchical(model, loader, device, min_size, threshold=0.
                 else:
                     nodule_metrics_large.append(m_nodule)
 
+        # Clear memory for this patient immediately
+        current_patient_preds.clear()
+        current_patient_gts.clear()
+
+    filter_parts = [f"≥{min_voxels_3d} voxels"]
+    if min_consecutive_slices > 1:
+        filter_parts.append(f"≥{min_consecutive_slices} slices")
+    if min_peak_prob > 0.0:
+        filter_parts.append(f"peak ≥{min_peak_prob:g}")
+    filter_desc = ", ".join(filter_parts)
+    print(f"\nRunning Comprehensive Evaluation on 2.5D Model (3D Filter: {filter_desc}, Threshold: {threshold})...")
+
+    with torch.no_grad():
+        for batch in tqdm(loader, desc="[Evaluating Slices]"):
+            images, masks, pids, s_idxs = batch[0], batch[1], batch[2], batch[3]
+            cropped_shapes = batch[4]
+            images = images.to(device, non_blocking=True)
+            masks = masks.to(device, non_blocking=True)
+
+            if device.type == "cuda":
+                with torch.amp.autocast('cuda'):
+                    outputs = model(images)
+            else:
+                outputs = model(images)
+
+            # Keep raw probabilities: the peak-confidence gate needs them at component level,
+            # and binarization is deferred until the 3D volume is assembled per patient.
+            probs_np = torch.sigmoid(outputs.float()).cpu().numpy()
+            masks_np = masks.cpu().numpy()
+
+            for b in range(probs_np.shape[0]):
+                p_prob = probs_np[b, 0].astype(np.float32)
+                g_mask = (masks_np[b, 0] > 0.5)
+                pid = str(pids[b])
+                s_idx = int(s_idxs[b]) if not isinstance(s_idxs[b], int) else s_idxs[b]
+
+                cs_h = float(cropped_shapes[0][b])
+                cs_w = float(cropped_shapes[1][b])
+
+                if pid != current_pid:
+                    finalize_current_patient()
+                    current_pid = pid
+                    current_cropped_shape = (cs_h, cs_w)
+
+                current_patient_preds[s_idx] = p_prob
+                current_patient_gts[s_idx] = g_mask
+
+    # Finalize the last patient after loop ends
+    finalize_current_patient()
+
     df_patients = pd.DataFrame(per_patient_rows)
 
     results = {
@@ -389,10 +459,17 @@ def evaluate_test_set_hierarchical(model, loader, device, min_size, threshold=0.
     return results
 
 
-def print_and_format_report(results, min_size, report_path, threshold=0.5):
+def print_and_format_report(results, min_voxels_3d, report_path, min_consecutive_slices=1,
+                            threshold=0.5, min_peak_prob=0.0):
+    filter_parts = [f"≥{min_voxels_3d} voxels"]
+    if min_consecutive_slices > 1:
+        filter_parts.append(f"≥{min_consecutive_slices} slices")
+    if min_peak_prob > 0.0:
+        filter_parts.append(f"peak ≥{min_peak_prob:g}")
+    filter_desc = ", ".join(filter_parts)
     lines = []
     lines.append("=========================================================================================================")
-    lines.append(f"                   HIERARCHICAL EVALUATION REPORT (2.5D, Filter ≥{min_size}px, Threshold: {threshold})")
+    lines.append(f"                   HIERARCHICAL EVALUATION REPORT (2.5D, 3D Filter: {filter_desc}, Threshold: {threshold})")
     lines.append("=========================================================================================================\n")
 
     def format_row(title, m):
@@ -468,7 +545,9 @@ def main():
     parser.add_argument("--split", type=str, choices=["train", "val", "test"], default=DEFAULT_SPLIT, help=f"Dataset split to evaluate: train, val, or test (default: {DEFAULT_SPLIT})")
     parser.add_argument("--batch_size", type=int, default=DEFAULT_BATCH_SIZE, help=f"Batch size for evaluation (default: {DEFAULT_BATCH_SIZE})")
     parser.add_argument("--num_workers", type=int, default=DEFAULT_NUM_WORKERS, help=f"DataLoader num_workers (default: {DEFAULT_NUM_WORKERS})")
-    parser.add_argument("--min_size", type=int, default=DEFAULT_MIN_SIZE, help=f"Minimum connected component size (in pixels) to keep (default: {DEFAULT_MIN_SIZE})")
+    parser.add_argument("--min_voxels_3d", "--min_voxels", "--min_size", type=int, default=DEFAULT_MIN_VOXELS_3D, help=f"Minimum 3D connected component volume in voxels (default: {DEFAULT_MIN_VOXELS_3D})")
+    parser.add_argument("--min_consecutive_slices", "--min_slices", "--min_z_slices", type=int, default=DEFAULT_MIN_CONSECUTIVE_SLICES, help=f"Minimum consecutive Z-slices a 3D component must span (default: {DEFAULT_MIN_CONSECUTIVE_SLICES})")
+    parser.add_argument("--min_peak_prob", "--peak_gate", type=float, default=DEFAULT_MIN_PEAK_PROB, help=f"Keep a 3D connected component only if its peak sigmoid probability reaches this value. Applied to whole components, so it deletes low-confidence blobs without eroding nodule boundaries. 0 disables the gate (default: {DEFAULT_MIN_PEAK_PROB})")
     parser.add_argument("--threshold", type=float, default=DEFAULT_THRESHOLD, help=f"Probability threshold for binarizing predictions (default: {DEFAULT_THRESHOLD})")
     parser.add_argument("--report_path", type=str, default=DEFAULT_REPORT_PATH, help=f"Output report text path (default: {DEFAULT_REPORT_PATH})")
     parser.add_argument("--seed", type=int, default=DEFAULT_SEED, help=f"Global random seed for full evaluation reproducibility (default: {DEFAULT_SEED})")
@@ -482,6 +561,7 @@ def main():
 
     _, val_transforms = get_transforms()
     eval_dataset = LIDC25DDataset(args.manifest, split=args.split, transform=val_transforms, seed=args.seed)
+    eval_dataset.data_entries = eval_dataset.full_split_df
     print(f"Loaded {len(eval_dataset)} '{args.split}' slices from {args.manifest}.")
 
     eval_loader = DataLoader(
@@ -493,9 +573,24 @@ def main():
     )
 
     model = load_trained_model(args.model_path, device)
-    results = evaluate_test_set_hierarchical(model, eval_loader, device, min_size=args.min_size, threshold=args.threshold)
+    results = evaluate_test_set_hierarchical(
+        model,
+        eval_loader,
+        device,
+        min_voxels_3d=args.min_voxels_3d,
+        min_consecutive_slices=args.min_consecutive_slices,
+        threshold=args.threshold,
+        min_peak_prob=args.min_peak_prob
+    )
 
-    print_and_format_report(results, min_size=args.min_size, report_path=args.report_path, threshold=args.threshold)
+    print_and_format_report(
+        results,
+        min_voxels_3d=args.min_voxels_3d,
+        report_path=args.report_path,
+        min_consecutive_slices=args.min_consecutive_slices,
+        threshold=args.threshold,
+        min_peak_prob=args.min_peak_prob
+    )
 
 
 if __name__ == "__main__":

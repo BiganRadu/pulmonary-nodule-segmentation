@@ -28,7 +28,7 @@ import pandas as pd
 import matplotlib.pyplot as plt
 from matplotlib.widgets import Button
 import inspect
-from scipy.ndimage import label
+from scipy.ndimage import label, find_objects
 
 # Local imports
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
@@ -37,25 +37,60 @@ from training.train import get_model
 # Default Configuration Constants
 DEFAULT_PATIENT_ID = "LIDC-IDRI-0035"
 DEFAULT_MANIFEST = "preprocessed_data/dataset_manifest.csv"
-DEFAULT_MODEL_PATH = "models/unet_dicefocal/unet_dicefocal.pth"
-DEFAULT_MIN_SIZE = 10
+DEFAULT_MODEL_PATH = "models/unet/unet.pth"
+DEFAULT_MIN_VOXELS_3D = 15
+DEFAULT_MIN_CONSECUTIVE_SLICES = 1
+DEFAULT_MIN_PEAK_PROB = 0.0
+DEFAULT_THRESHOLD = 0.5
 
-def remove_small_objects(binary_mask, min_size):
+
+def remove_small_objects_3d(vol_binary, min_voxels=15, min_consecutive_slices=1,
+                            vol_prob=None, min_peak_prob=0.0):
     """
-    Removes connected components in binary_mask that have fewer than min_size pixels.
-    Eliminates small false positive noise predictions.
+    Applies 3D connected-component labeling on full 3D CT volume (26-connectivity).
+    - Removes any 3D connected component with volume < min_voxels.
+    - If min_consecutive_slices > 1: removes components spanning fewer than min_consecutive_slices axial slices.
+    - If min_peak_prob > 0 (and vol_prob is supplied): removes 3D components whose PEAK sigmoid
+      probability never reaches min_peak_prob.
     """
-    if min_size <= 0 or np.sum(binary_mask) == 0:
-        return binary_mask
-    labeled_mask, num_features = label(binary_mask)
-    if num_features == 0:
-        return binary_mask
-    component_sizes = np.bincount(labeled_mask.ravel())
-    too_small = component_sizes < min_size
-    too_small[0] = False  # Ensure background is never removed
-    cleaned_mask = binary_mask.copy()
-    cleaned_mask[too_small[labeled_mask]] = 0
-    return cleaned_mask
+    if np.sum(vol_binary) == 0:
+        return vol_binary
+
+    use_peak_gate = (min_peak_prob > 0.0 and vol_prob is not None)
+
+    # Step 1: 3D Connected-Component Size, Slice-Span & Peak-Confidence Filtering
+    if min_voxels > 0 or min_consecutive_slices > 1 or use_peak_gate:
+        labeled_mask, num_features = label(vol_binary, structure=np.ones((3, 3, 3), dtype=bool))
+        if num_features == 0:
+            return vol_binary
+        component_sizes = np.bincount(labeled_mask.ravel(), minlength=num_features + 1)
+        too_small = np.zeros(num_features + 1, dtype=bool)
+
+        if min_voxels > 0:
+            too_small |= (component_sizes < min_voxels)
+
+        if min_consecutive_slices > 1:
+            objects = find_objects(labeled_mask)
+            for idx, bbox in enumerate(objects, start=1):
+                if bbox is not None:
+                    z_span = bbox[2].stop - bbox[2].start
+                    if z_span < min_consecutive_slices:
+                        too_small[idx] = True
+
+        if use_peak_gate:
+            flat_labels = labeled_mask.ravel()
+            fg = np.flatnonzero(flat_labels)
+            comp_peak = np.zeros(num_features + 1, dtype=np.float32)
+            np.maximum.at(comp_peak, flat_labels[fg], vol_prob.ravel()[fg].astype(np.float32))
+            too_small |= (comp_peak < min_peak_prob)
+
+        too_small[0] = False  # Ensure background is never removed
+        cleaned_vol = vol_binary.copy()
+        cleaned_vol[too_small[labeled_mask]] = False
+    else:
+        cleaned_vol = vol_binary.copy()
+
+    return cleaned_vol
 
 def compute_slice_dice(pred_mask, gt_mask):
     """
@@ -144,19 +179,30 @@ def load_trained_model(model_path, device):
 
 
 class PatientSliceVisualizer:
-    def __init__(self, patient_df, model, device, patient_id, min_size=30):
+    def __init__(self, patient_df, model, device, patient_id, min_voxels_3d=15, min_consecutive_slices=1,
+                 threshold=0.5, min_peak_prob=0.0):
         self.patient_df = patient_df
         self.model = model
         self.device = device
         self.patient_id = patient_id
-        self.min_size = min_size
+        self.min_voxels_3d = min_voxels_3d
+        self.min_consecutive_slices = min_consecutive_slices
+        self.threshold = threshold
+        self.min_peak_prob = min_peak_prob
         self.total_slices = len(patient_df)
         self.current_idx = 0
 
-        print(f"\nPre-computing predictions for all {self.total_slices} slices of patient {patient_id} (Filtering objects < {min_size}px)...")
+        filter_parts = [f"≥{min_voxels_3d} voxels"]
+        if min_consecutive_slices > 1:
+            filter_parts.append(f"≥{min_consecutive_slices} slices")
+        if min_peak_prob > 0.0:
+            filter_parts.append(f"peak ≥{min_peak_prob:g}")
+        self.filter_str = ", ".join(filter_parts)
+
+        print(f"\nPre-computing predictions for all {self.total_slices} slices of patient {patient_id} (3D Filter: {self.filter_str}, Threshold: {threshold})...")
         self.images = []
         self.gt_masks = []
-        self.pred_masks = []
+        raw_probs = []
         self.slice_indices = []
         self.gt_tumor_flags = []
 
@@ -180,14 +226,11 @@ class PatientSliceVisualizer:
 
                 # Interpolate prediction back to original (H, W) resolution
                 logits = F.interpolate(logits_resized, size=orig_shape, mode='bilinear', align_corners=False)
-                pred = (torch.sigmoid(logits) > 0.5).float().squeeze().cpu().numpy()
-                
-                if self.min_size > 0:
-                    pred = remove_small_objects(pred, min_size=self.min_size)
+                prob = torch.sigmoid(logits.float()).squeeze().cpu().numpy().astype(np.float32)
 
                 self.images.append(img.squeeze())
                 self.gt_masks.append(gt.squeeze())
-                self.pred_masks.append(pred)
+                raw_probs.append(prob)
                 self.slice_indices.append(int(row["slice_idx"]))
                 self.gt_tumor_flags.append(int(row["has_tumor"]))
 
@@ -195,6 +238,20 @@ class PatientSliceVisualizer:
         if self.total_slices == 0:
             print("Error: No valid slice files were loaded.")
             sys.exit(1)
+
+        # Assemble full 3D probability volume, binarize and apply 3D Volumetric Filtering + Peak-Confidence Gate
+        vol_prob = np.stack(raw_probs, axis=-1)
+        vol_pred = vol_prob > self.threshold
+        if (self.min_voxels_3d > 0 or self.min_consecutive_slices > 1 or self.min_peak_prob > 0.0) and np.sum(vol_pred) > 0:
+            vol_pred = remove_small_objects_3d(
+                vol_pred,
+                min_voxels=self.min_voxels_3d,
+                min_consecutive_slices=self.min_consecutive_slices,
+                vol_prob=vol_prob,
+                min_peak_prob=self.min_peak_prob
+            )
+
+        self.pred_masks = [vol_pred[:, :, i].astype(np.float32) for i in range(self.total_slices)]
 
         print(f"Successfully loaded {self.total_slices} slices for patient {patient_id}.")
         print("Starting interactive GUI... Use ← / → Arrow Keys or ON-SCREEN BUTTONS to navigate.")
@@ -260,7 +317,7 @@ class PatientSliceVisualizer:
         else:
             pred_status = "[PREDICTED HEALTHY]"
             pred_color = 'darkgreen'
-        filter_str = f" [≥{self.min_size}px Filter]" if self.min_size > 0 else ""
+        filter_str = f" [{self.filter_str}]" if self.filter_str else ""
         self.axes[2].set_title(f"MONAI UNet Prediction{filter_str}\n{pred_status} | Dice: {slice_dice:.3f}", fontsize=11, fontweight='bold', color=pred_color)
         self.axes[2].axis('off')
 
@@ -290,12 +347,16 @@ class PatientSliceVisualizer:
         elif event.key in ['right', 'up', 'page-up', 'n']:
             self.next_slice()
 
+
 def main():
     parser = argparse.ArgumentParser(description="Interactive Patient 2D Slice Visualizer (CT vs Ground Truth vs MONAI UNet)")
     parser.add_argument("-p", "--patient_id", type=str, default=DEFAULT_PATIENT_ID, help=f"Patient ID to visualize (e.g. LIDC-IDRI-0072 or 72) (default: {DEFAULT_PATIENT_ID})")
     parser.add_argument("--manifest", type=str, default=DEFAULT_MANIFEST, help=f"Path to preprocessed dataset manifest CSV (default: {DEFAULT_MANIFEST})")
     parser.add_argument("--model_path", type=str, default=DEFAULT_MODEL_PATH, help=f"Path to trained model checkpoint (default: {DEFAULT_MODEL_PATH})")
-    parser.add_argument("--min_size", type=int, default=DEFAULT_MIN_SIZE, help=f"Minimum connected component size (in pixels) to keep (default: {DEFAULT_MIN_SIZE})")
+    parser.add_argument("--min_voxels_3d", "--min_voxels", "--min_size", type=int, default=DEFAULT_MIN_VOXELS_3D, help=f"Minimum 3D connected component volume in voxels (default: {DEFAULT_MIN_VOXELS_3D})")
+    parser.add_argument("--min_consecutive_slices", "--min_slices", "--min_z_slices", type=int, default=DEFAULT_MIN_CONSECUTIVE_SLICES, help=f"Minimum consecutive Z-slices a 3D component must span (default: {DEFAULT_MIN_CONSECUTIVE_SLICES})")
+    parser.add_argument("--min_peak_prob", "--peak_gate", type=float, default=DEFAULT_MIN_PEAK_PROB, help=f"Keep a 3D connected component only if its peak sigmoid probability reaches this value (default: {DEFAULT_MIN_PEAK_PROB})")
+    parser.add_argument("--threshold", type=float, default=DEFAULT_THRESHOLD, help=f"Probability threshold for binarizing predictions (default: {DEFAULT_THRESHOLD})")
 
     args = parser.parse_args()
 
@@ -305,8 +366,15 @@ def main():
     patient_df, patient_id = load_patient_slices(args.manifest, args.patient_id)
     model = load_trained_model(args.model_path, device)
 
-    visualizer = PatientSliceVisualizer(patient_df, model, device, patient_id, min_size=args.min_size)
+    visualizer = PatientSliceVisualizer(
+        patient_df, model, device, patient_id,
+        min_voxels_3d=args.min_voxels_3d,
+        min_consecutive_slices=args.min_consecutive_slices,
+        threshold=args.threshold,
+        min_peak_prob=args.min_peak_prob
+    )
     plt.show()
+
 
 if __name__ == "__main__":
     main()
