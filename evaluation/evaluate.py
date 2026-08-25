@@ -46,6 +46,8 @@ DEFAULT_BATCH_SIZE = 32
 DEFAULT_NUM_WORKERS = 8
 DEFAULT_MIN_VOXELS_3D = 15
 DEFAULT_MIN_PEAK_PROB = 0.0
+DEFAULT_MAX_ELONGATION = 0.0   # 0 = elongation filter disabled
+DEFAULT_TTA = 0                # 1 = average sigmoid over 4 flips
 DEFAULT_REPORT_PATH = "models/unet/test_evaluation_report.txt"
 DEFAULT_THRESHOLD = 0.5
 DEFAULT_SEED = 42
@@ -65,12 +67,81 @@ def set_seed(seed=42):
     monai.utils.set_determinism(seed=seed)
 
 
-def remove_small_objects_3d(vol_binary, min_voxels=15, vol_prob=None, min_peak_prob=0.0):
+def component_elongation(labeled_mask, num_features, spacing):
+    """
+    Per-component sqrt(lambda1 / lambda3) of the voxel-coordinate covariance, in millimetres.
+
+    Pulmonary vessels are tubular and score high; nodules are compact and score near 1.
+    Coordinates are scaled by `spacing` because voxels are anisotropic after the 256x256
+    resize (in-plane mm/px varies per patient, Z is 1mm), and unscaled coordinates would
+    make an in-plane vessel look different from a through-plane one.
+
+    Returns an array indexed 0..num_features (index 0 is background, unused).
+    """
+    H, W, Z = labeled_mask.shape
+    flat = np.ascontiguousarray(labeled_mask).ravel()
+    fg = np.flatnonzero(flat)
+    m = num_features + 1
+    if fg.size == 0:
+        return np.ones(m, dtype=np.float64)
+
+    lz = flat[fg]
+    coords = (
+        (fg // (W * Z)).astype(np.float64) * spacing[0],
+        ((fg // Z) % W).astype(np.float64) * spacing[1],
+        (fg % Z).astype(np.float64) * spacing[2],
+    )
+    cnt = np.bincount(lz, minlength=m).astype(np.float64)
+    safe = np.maximum(cnt, 1.0)
+    mean = [np.bincount(lz, weights=c, minlength=m) / safe for c in coords]
+
+    cov = np.zeros((m, 3, 3), dtype=np.float64)
+    for i in range(3):
+        for j in range(i, 3):
+            sij = np.bincount(lz, weights=coords[i] * coords[j], minlength=m) / safe
+            cij = sij - mean[i] * mean[j]
+            cov[:, i, j] = cij
+            cov[:, j, i] = cij
+
+    ev = np.linalg.eigvalsh(cov)                      # ascending eigenvalues
+    l3 = np.maximum(ev[:, 0], 1e-9)
+    l1 = np.maximum(ev[:, 2], 1e-9)
+    elong = np.sqrt(l1 / l3)
+    elong[cnt < 4] = 1.0        # too few voxels for a meaningful covariance
+    return elong
+
+
+def predict_probs(model, images, device, tta=False):
+    """
+    Sigmoid probabilities for a batch. With tta=True the prediction is averaged over the
+    4 horizontal/vertical flip combinations, each flip undone before accumulating.
+    Training used RandFlipd on both spatial axes, so these views are in-distribution.
+    """
+    views = [()] if not tta else [(), (2,), (3,), (2, 3)]
+    acc = None
+    for dims in views:
+        x = torch.flip(images, dims) if dims else images
+        if device.type == "cuda":
+            with torch.amp.autocast('cuda'):
+                logits = model(x)
+        else:
+            logits = model(x)
+        p = torch.sigmoid(logits.float())
+        if dims:
+            p = torch.flip(p, dims)
+        acc = p if acc is None else acc + p
+    return acc / len(views)
+
+
+def remove_small_objects_3d(vol_binary, min_voxels=15, vol_prob=None, min_peak_prob=0.0,
+                            max_elongation=0.0, spacing=(1.0, 1.0, 1.0)):
     """
     Applies 3D connected-component labeling on full 3D CT volume (26-connectivity).
     - Removes 3D components with volume < min_voxels.
     - If min_peak_prob > 0 (and vol_prob is supplied): removes 3D components whose PEAK sigmoid
       probability never reaches min_peak_prob.
+    - If max_elongation > 0: removes 3D components more elongated than that (tubular vessels),
+      measured in millimetres via `spacing`.
 
     The peak-probability gate is a detection decision applied to whole components, kept separate
     from the pixel binarization threshold, which is a segmentation decision. This lets a low pixel
@@ -81,9 +152,10 @@ def remove_small_objects_3d(vol_binary, min_voxels=15, vol_prob=None, min_peak_p
         return vol_binary
 
     use_peak_gate = (min_peak_prob > 0.0 and vol_prob is not None)
+    use_shape_gate = (max_elongation > 0.0)
 
     # Step 1: 3D Connected-Component Size & Peak-Confidence Filtering
-    if min_voxels > 0 or use_peak_gate:
+    if min_voxels > 0 or use_peak_gate or use_shape_gate:
         labeled_mask, num_features = label(vol_binary, structure=np.ones((3, 3, 3), dtype=bool))
         if num_features == 0:
             return vol_binary
@@ -100,6 +172,10 @@ def remove_small_objects_3d(vol_binary, min_voxels=15, vol_prob=None, min_peak_p
             comp_peak = np.zeros(num_features + 1, dtype=np.float32)
             np.maximum.at(comp_peak, flat_labels[fg], vol_prob.ravel()[fg].astype(np.float32))
             too_small |= (comp_peak < min_peak_prob)
+
+        if use_shape_gate:
+            elong = component_elongation(labeled_mask, num_features, spacing)
+            too_small |= (elong > max_elongation)
 
         too_small[0] = False  # Ensure background is never removed
         cleaned_vol = vol_binary.copy()
@@ -226,7 +302,8 @@ def aggregate_metric_dict(list_of_metric_dicts):
 
 
 def evaluate_test_set_hierarchical(model, loader, device, min_voxels_3d=15,
-                                   threshold=0.5, min_peak_prob=0.0):
+                                   threshold=0.5, min_peak_prob=0.0,
+                                   max_elongation=0.0, tta=False):
     """
     Comprehensive hierarchical evaluation:
     1. Per-Slice evaluation (All slices & Positive tumor slices)
@@ -263,18 +340,20 @@ def evaluate_test_set_hierarchical(model, loader, device, min_voxels_3d=15,
         vol_pred = vol_prob > threshold
         vol_gt = np.stack([current_patient_gts[k] for k in s_keys], axis=-1)
 
-        # Apply 3D Volumetric Connected-Component Filtering + Peak-Confidence Gate
-        if (min_voxels_3d > 0 or min_peak_prob > 0.0) and np.sum(vol_pred) > 0:
+        cs_h, cs_w = current_cropped_shape
+        spacing_3d = (cs_h / 256.0, cs_w / 256.0, 1.0)
+        spacing_2d = (cs_h / 256.0, cs_w / 256.0)
+
+        # Apply 3D Volumetric Connected-Component Filtering + Peak-Confidence + Shape Gates
+        if (min_voxels_3d > 0 or min_peak_prob > 0.0 or max_elongation > 0.0) and np.sum(vol_pred) > 0:
             vol_pred = remove_small_objects_3d(
                 vol_pred,
                 min_voxels=min_voxels_3d,
                 vol_prob=vol_prob,
-                min_peak_prob=min_peak_prob
+                min_peak_prob=min_peak_prob,
+                max_elongation=max_elongation,
+                spacing=spacing_3d
             )
-
-        cs_h, cs_w = current_cropped_shape
-        spacing_3d = (cs_h / 256.0, cs_w / 256.0, 1.0)
-        spacing_2d = (cs_h / 256.0, cs_w / 256.0)
 
         # 1. 3D Patient Volumetric Metrics
         m_patient = compute_single_mask_metrics(vol_pred, vol_gt, spacing=spacing_3d)
@@ -349,6 +428,10 @@ def evaluate_test_set_hierarchical(model, loader, device, min_voxels_3d=15,
     filter_parts = [f"≥{min_voxels_3d} voxels"]
     if min_peak_prob > 0.0:
         filter_parts.append(f"peak ≥{min_peak_prob:g}")
+    if max_elongation > 0.0:
+        filter_parts.append(f"elong ≤{max_elongation:g}")
+    if tta:
+        filter_parts.append("TTA x4")
     filter_desc = ", ".join(filter_parts)
     print(f"\nRunning Comprehensive Evaluation on 2D Model (3D Filter: {filter_desc}, Threshold: {threshold})...")
 
@@ -359,15 +442,9 @@ def evaluate_test_set_hierarchical(model, loader, device, min_voxels_3d=15,
             images = images.to(device, non_blocking=True)
             masks = masks.to(device, non_blocking=True)
 
-            if device.type == "cuda":
-                with torch.amp.autocast('cuda'):
-                    logits = model(images)
-            else:
-                logits = model(images)
-
             # Keep raw probabilities: the peak-confidence gate needs them at component level,
             # and binarization is deferred until the 3D volume is assembled per patient.
-            probs_np = torch.sigmoid(logits.float()).cpu().numpy()
+            probs_np = predict_probs(model, images, device, tta=tta).cpu().numpy()
             masks_np = masks.cpu().numpy()
 
             for b in range(probs_np.shape[0]):
@@ -409,13 +486,18 @@ def evaluate_test_set_hierarchical(model, loader, device, min_voxels_3d=15,
 
 
 def print_and_format_report(results, min_voxels_3d, report_path,
-                            threshold=0.5, min_peak_prob=0.0):
+                            threshold=0.5, min_peak_prob=0.0,
+                            max_elongation=0.0, tta=False):
     """
     Formats clean metric tables and saves full report to file.
     """
     filter_parts = [f"≥{min_voxels_3d} voxels"]
     if min_peak_prob > 0.0:
         filter_parts.append(f"peak ≥{min_peak_prob:g}")
+    if max_elongation > 0.0:
+        filter_parts.append(f"elong ≤{max_elongation:g}")
+    if tta:
+        filter_parts.append("TTA x4")
     filter_desc = ", ".join(filter_parts)
     lines = []
     lines.append("=========================================================================================================")
@@ -542,6 +624,8 @@ def main():
     parser.add_argument("--num_workers", type=int, default=DEFAULT_NUM_WORKERS, help=f"DataLoader num_workers (default: {DEFAULT_NUM_WORKERS})")
     parser.add_argument("--min_voxels_3d", "--min_voxels", "--min_size", type=int, default=DEFAULT_MIN_VOXELS_3D, help=f"Minimum 3D connected component volume in voxels (default: {DEFAULT_MIN_VOXELS_3D})")
     parser.add_argument("--min_peak_prob", "--peak_gate", type=float, default=DEFAULT_MIN_PEAK_PROB, help=f"Keep a 3D connected component only if its peak sigmoid probability reaches this value. Applied to whole components, so it deletes low-confidence blobs without eroding nodule boundaries. 0 disables the gate (default: {DEFAULT_MIN_PEAK_PROB})")
+    parser.add_argument("--max_elongation", "--max_elong", type=float, default=DEFAULT_MAX_ELONGATION, help=f"Drop 3D components whose sqrt(lambda1/lambda3) exceeds this, i.e. tubular vessels. Nodules sit near 1; ~2.5-3.0 is a reasonable cut. 0 disables (default: {DEFAULT_MAX_ELONGATION})")
+    parser.add_argument("--tta", type=int, default=DEFAULT_TTA, help=f"1 = average the sigmoid over 4 horizontal/vertical flips. Costs ~4x forward passes but the pipeline is I/O bound, so wall-clock impact is small (default: {DEFAULT_TTA})")
     parser.add_argument("--threshold", type=float, default=DEFAULT_THRESHOLD, help=f"Probability threshold for binarizing predictions (default: {DEFAULT_THRESHOLD})")
     parser.add_argument("--report_path", type=str, default=DEFAULT_REPORT_PATH, help=f"Path for evaluation text report (default: {DEFAULT_REPORT_PATH})")
     parser.add_argument("--seed", type=int, default=DEFAULT_SEED, help=f"Global random seed for full evaluation reproducibility (default: {DEFAULT_SEED})")
@@ -574,14 +658,18 @@ def main():
         device,
         min_voxels_3d=args.min_voxels_3d,
         threshold=args.threshold,
-        min_peak_prob=args.min_peak_prob
+        min_peak_prob=args.min_peak_prob,
+        max_elongation=args.max_elongation,
+        tta=bool(args.tta)
     )
     print_and_format_report(
         results,
         min_voxels_3d=args.min_voxels_3d,
         report_path=args.report_path,
         threshold=args.threshold,
-        min_peak_prob=args.min_peak_prob
+        min_peak_prob=args.min_peak_prob,
+        max_elongation=args.max_elongation,
+        tta=bool(args.tta)
     )
 
 
