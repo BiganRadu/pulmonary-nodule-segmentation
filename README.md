@@ -4,7 +4,7 @@
 [![PyTorch](https://img.shields.io/badge/PyTorch-2.0%2B-ee4c2c.svg)](https://pytorch.org/)
 [![MONAI](https://img.shields.io/badge/MONAI-1.3.0%2B-5c2d91.svg)](https://monai.io/)
 
-An end-to-end, high-performance deep learning framework for **2D and 2.5D pulmonary nodule segmentation** on thoracic Computed Tomography (CT) scans from the **LIDC-IDRI** dataset. Built with PyTorch and MONAI, this project implements DICOM preprocessing, majority-voting consensus annotation, dynamic negative slice sampling, mixed-precision training, parameter validation sweeps, and a 4-level hierarchical evaluation suite comparing multiple deep neural architectures across varied loss functions, spatial context representations, and data augmentation regimes.
+An end-to-end, high-performance deep learning framework for **2D and 2.5D pulmonary nodule segmentation** on thoracic Computed Tomography (CT) scans from the **LIDC-IDRI** dataset. Built with PyTorch and MONAI, this project implements DICOM preprocessing, majority-voting consensus annotation, dynamic negative slice sampling, mixed-precision training, a 3D component-level false-positive reduction stage tuned by a 4,860-configuration validation sweep, and a 4-level hierarchical evaluation suite comparing multiple deep neural architectures across varied loss functions, spatial context representations, and data augmentation regimes.
 
 ---
 
@@ -36,7 +36,7 @@ The master manifest indexes all **240,242 resampled 2D slices** across 1,010 pat
 
 > [!NOTE]
 > **Inter-Annotator Agreement Benchmark:**
-> Individual radiologist annotations across the LIDC-IDRI dataset show a mean pairwise inter-annotator Dice agreement of **0.5896** (median **0.6421**, std **0.2272**). Models are evaluated against the 50% majority consensus mask (which provides a smoother, more centered ground truth). The top-performing segmentation models (e.g. Attention UNet 2.5D with 0.6645 2D tumor Dice / 0.6935 3D nodule Dice) operate near the intrinsic noise ceiling of expert human variability.
+> Individual radiologist annotations across the LIDC-IDRI dataset show a mean pairwise inter-annotator Dice agreement of **0.5896** (median **0.6421**, std **0.2272**). Models are evaluated against the 50% majority consensus mask (which provides a smoother, more centered ground truth). The top-performing configuration (Attention UNet 2.5D: 0.6104 2D tumour Dice, 0.5928 3D per-nodule Dice at the operating point selected in §5.1) sits close to the intrinsic noise ceiling of expert human variability. Raising the operating point toward maximum tumour Dice reaches 0.7256 on validation, at the cost of far more false positives — see §5.1.
 
 ---
 
@@ -145,176 +145,245 @@ Training is performed using `training/train.py` for 2D single-slice models and `
 
 ---
 
-## 4. Evaluation Pipeline & Parameter Sweeps
+## 4. Evaluation Pipeline & Post-Processing
 
-Model evaluation is executed via `evaluation/evaluate.py` (2D models) and `evaluation/evaluate_2_5d.py` (2.5D models), producing text summaries and structured CSV breakdowns (`patient_evaluation_breakdown.csv`).
+Evaluation is run by `evaluation/evaluate.py` (2D models) and `evaluation/evaluate_2_5d.py` (2.5D models), producing a text report plus a per-patient CSV breakdown.
 
-### 4.1 Hierarchical 4-Level Evaluation Framework
-1. **Per-Slice 2D Evaluation:** Calculates Dice, IoU, Precision, Sensitivity, Specificity, Hausdorff Distance (HD95), Average Surface Distance (ASD), False Alarm Rate (FA %), and Failure Rate across tumor-positive slices.
-2. **Per-Patient 3D Reconstruction:** Reconstructs full 3D CT volumes by stacking 2D slice predictions along the z-axis, computing 3D volumetric Dice and surface distances per patient.
-3. **Per-Nodule 3D Lesion Analysis:** Applies 3D connected-component labeling to extract individual nodule lesions, evaluating metrics across three size categories:
-   - **Small Nodules:** Volume $< 100$ voxels ($< 0.1 \text{ cm}^3$)
-   - **Medium Nodules:** Volume $100 \text{ to } 1000$ voxels ($0.1 \text{ to } 1.0 \text{ cm}^3$)
-   - **Large Nodules:** Volume $\ge 1000$ voxels ($\ge 1.0 \text{ cm}^3$)
-4. **Post-Processing Connected Component Filter (`--min_size`):** Removes predicted 2D foreground noise blobs smaller than a pixel threshold.
+### 4.1 The Two Headline Metrics
 
-### 4.2 Complete Evaluation CLI Parameters
+Two Dice numbers are reported, and they answer different questions:
 
-| Parameter | Command Argument | Default Value | Description |
+| Metric | Averaged over | Measures |
+|---|---|---|
+| **2D Dice — tumour slices** | the 1,395 test slices containing a nodule | segmentation quality |
+| **2D Dice — all slices** | all 23,622 test slices (empty prediction on empty ground truth = 1.0) | the system as a whole |
+
+The all-slice metric decomposes exactly:
+
+$$\text{Dice}_{\text{all}} \;=\; 0.941 \times (1 - \text{FA}_{\text{neg}}) \;+\; 0.059 \times \text{Dice}_{\text{tumour}}$$
+
+where $\text{FA}_{\text{neg}}$ is the fraction of tumour-free slices carrying at least one predicted pixel. **94% of the all-slice score is decided on slices that contain no tumour at all.** One point of false-alarm rate is therefore worth roughly *sixteen times* as much as one point of tumour Dice — which is why the post-processing stage below exists, and why it is allowed to trade a little tumour Dice away.
+
+### 4.2 Post-Processing Pipeline
+
+The earlier per-slice 2D blob filter has been removed. Predictions are now reassembled into the full 3D patient volume before any filtering, and detection is separated from segmentation:
+
+```
+probability volume (per patient)
+   │
+   ▼
+1. Pixel threshold ─────────► SEGMENTATION decision: how tightly the mask
+   (--threshold)              hugs each lesion boundary
+   │
+   ▼
+2. 3D connected components ─► 26-connectivity labelling on the reconstructed
+   + min volume               volume; the 2D filter had no context along Z
+   (--min_voxels_3d)
+   │
+   ▼
+3. Peak-probability gate ───► DETECTION decision: keep a component only if its
+   (--min_peak_prob)          MAXIMUM probability clears the gate. Low-confidence
+   │                          blobs are deleted whole, never eroded.
+   ▼
+4. Shape gate ──────────────► drop components whose sqrt(λ1/λ3) exceeds a cut.
+   (--max_elongation)         Vessels are tubular; nodules are compact (≈1).
+   │
+   ▼
+   final mask         (+ optional --tta: sigmoid averaged over 4 flips)
+```
+
+**Why stages 1 and 3 must be separate.** A single threshold doing both jobs trades tumour Dice away point-for-point: raising it to suppress false blobs also erodes every real boundary. Binarising *low* and gating whole components on confidence breaks that trade-off. Stage 3 is exactly 3D hysteresis thresholding — "the component contains a voxel above $t_{high}$" is identical to "$\max(\text{component}) \ge t_{high}$".
+
+### 4.3 Evaluation CLI Parameters
+
+| Parameter | Default | Description |
+|---|---|---|
+| `--model_path` | — | Path to the trained `.pth` checkpoint |
+| `--split` | `test` | Dataset split (`train`, `val`, `test`) |
+| `--threshold` | `0.5` | Probability threshold for binarisation |
+| `--min_voxels_3d` | `15` | Minimum 3D connected-component volume, in voxels |
+| `--min_peak_prob` | `0.0` (off) | Keep a component only if its peak probability reaches this |
+| `--max_elongation` | `0.0` (off) | Drop components more elongated than this |
+| `--tta` | `0` | `1` = average the sigmoid over 4 horizontal/vertical flips |
+| `--report_path` | `<model_dir>/test_evaluation_report.txt` | Output report path |
+| `--batch_size` / `--num_workers` / `--seed` | `32` / `8` / `42` | Standard |
+
+### 4.4 Hierarchical Evaluation Framework
+
+1. **Per-slice 2D** — tumour slices and all slices, with Dice, IoU, Precision, Sensitivity, Specificity, HD95, ASD, failure rate and false-alarm rate.
+2. **Per-patient 3D** — slices stacked into the patient volume, volumetric Dice and surface distances.
+3. **Per-nodule 3D** — connected-component lesion analysis, stratified into Small (<100 voxels), Medium (100–1000) and Large (≥1000).
+4. **Per-patient CSV** — `patient_evaluation_breakdown.csv`.
+
+> [!NOTE]
+> Per-nodule metrics are computed inside each lesion's bounding box, so they measure segmentation quality **given** a correct detection. They are not detection results.
+
+---
+
+## 5. Experimental Results
+
+All post-processing parameters were selected on the **validation split**. The test split was used exactly once per model, after the parameters were fixed.
+
+### 5.1 Operating Point Selection (Validation Split)
+
+A grid of **4,860 configurations** — pixel threshold × minimum volume × peak gate × elongation cut — was swept for all 9 models on the validation split (101 patients, 23,124 slices). The full grid is committed at [`model_evals/val_operating_point_grid.csv`](model_evals/val_operating_point_grid.csv).
+
+The operating point for each model was chosen by a constrained rule:
+
+> **Maximise 2D all-slice Dice, subject to 2D tumour-slice Dice remaining at least `0.90 ×` that model's own unfiltered tumour-Dice ceiling.**
+
+The floor is *relative* because the models differ enormously in baseline quality — Attention UNet 2.5D reaches 0.726 unfiltered while UNet (No Aug) reaches only 0.376, so a single absolute floor would exclude the weaker models outright.
+
+![Operating Point Selection](charts/operating_point_selection.png)
+
+| Model | threshold | min voxels | peak gate | max elongation | Val all-Dice | Val tumour Dice |
+|---|---|---|---|---|---|---|
+| Attention UNet 2.5D | 0.5 | 35 | 0.997 | 2.5 | 0.8723 | 0.6553 |
+| SegResNet 2.5D | 0.4 | 35 | 0.990 | 2.5 | 0.8804 | 0.6327 |
+| UNet 2.5D | 0.4 | 35 | 0.990 | 2.5 | 0.8653 | 0.5878 |
+| Attention UNet 2D | 0.6 | 15 | 0.997 | 3.0 | 0.8416 | 0.5793 |
+| SegResNet 2D | 0.5 | 35 | 0.990 | 3.0 | 0.8082 | 0.6037 |
+| UNet 2D (DiceFocal) | 0.4 | 35 | 0.990 | 3.0 | 0.8672 | 0.5315 |
+| UNet 2D (DiceCE) | 0.6 | 15 | off | 2.5 | 0.7962 | 0.5143 |
+| UNet 2D (TverskyFocal) | 0.7 | 60 | 0.9995 | 2.5 | 0.7862 | 0.4990 |
+| UNet 2D (No Aug) | 0.7 | 60 | 0.9995 | 3.0 | 0.8814 | 0.3421 |
+
+Chosen points are committed at [`model_evals/selected_operating_points.csv`](model_evals/selected_operating_points.csv).
+
+---
+
+### 5.2 Test Set Results
+
+Held-out test split: 101 patients, 23,622 slices (1,395 tumour-positive), 186 distinct 3D nodules. Each model evaluated once, at its validation-selected operating point, with 4-flip TTA.
+
+| Model | Input | 2D Dice (all) | 2D Dice (tumour) | 3D Dice (nodule) | 3D Dice (patient) | FA on tumour-free slices | Nodule failure |
+|---|---|---|---|---|---|---|---|
+| **Attention UNet 2.5D** | 2.5D | 0.9100 | **0.6104** | **0.5928** | 0.4565 | 6.7% | **27.4%** |
+| **SegResNet 2.5D** | 2.5D | 0.8961 | **0.6106** | 0.5736 | 0.4255 | 8.1% | 28.0% |
+| **UNet 2.5D** | 2.5D | 0.9182 | 0.5873 | 0.5483 | 0.4515 | 5.7% | 31.7% |
+| **Attention UNet 2D** | 2D | 0.9064 | 0.5711 | 0.5587 | **0.4601** | 6.8% | 28.5% |
+| **SegResNet 2D** | 2D | 0.8598 | 0.5612 | 0.5299 | 0.3478 | 11.4% | 32.3% |
+| **UNet 2D (DiceFocal)** | 2D | 0.9211 | 0.5451 | 0.5112 | 0.4632 | 5.2% | 35.5% |
+| **UNet 2D (DiceCE)** | 2D | 0.8666 | 0.4829 | 0.4842 | 0.3721 | 10.3% | 33.3% |
+| **UNet 2D (TverskyFocal)** | 2D | 0.8815 | 0.4677 | 0.4522 | 0.3588 | 8.7% | 41.9% |
+| ⚠️ **UNet 2D (No Aug)** | 2D | *0.9432* | 0.2054 | 0.1825 | 0.2220 | 1.0% | 74.2% |
+
+![Test Performance Comparison](charts/test_performance_comparison.png)
+
+> [!WARNING]
+> **The No-Aug row is not a competitive result.** It posts the highest all-slice Dice (0.9432) *because it predicts almost nothing* — sensitivity 0.2102 and 74.2% of lesions missed entirely. On a metric where 94% of the weight sits on empty slices, a model that outputs nothing scores well. The constrained selection rule cannot protect a model that has no signal to protect.
+
+> [!NOTE]
+> Because each model was tuned against its own floor, the all-slice Dice column reflects how aggressively each model was *permitted to filter*, not architecture quality alone. **Tumour Dice and per-nodule Dice are the cleaner architecture comparisons.**
+
+---
+
+### 5.3 Effect of the Post-Processing Pipeline
+
+The same Attention UNet 2.5D checkpoint, under the previous per-slice 2D blob filter versus the current pipeline:
+
+| Metric | 2D blob filter (previous) | 3D + peak gate + shape + TTA | Change |
 |---|---|---|---|
-| **Manifest Path** | `--manifest` | `preprocessed_data/dataset_manifest.csv` | Path to master dataset manifest CSV |
-| **Model Checkpoint**| `--model_path` | `models/unet/unet.pth` | Path to trained model checkpoint `.pth` |
-| **Data Split** | `--split` | `val` (or `test`) | Dataset split to evaluate (`train`, `val`, `test`) |
-| **Batch Size** | `--batch_size` | `32` | Evaluation batch size |
-| **Num Workers** | `--num_workers` | `8` | DataLoader worker threads |
-| **Min Component Size**| `--min_size` | `10` | Minimum connected component size (pixels) to retain |
-| **Binarization Threshold**| `--threshold` | `0.5` | Sigmoid probability binarization threshold |
-| **Report Path** | `--report_path` | `<model_dir>/test_evaluation_report.txt` | Path for formatted evaluation report output |
-| **Random Seed** | `--seed` | `42` | Global seed for deterministic sampling |
+| 2D Dice — all slices | 0.4383 | **0.9100** | **+0.4717** |
+| 2D Dice — tumour slices | 0.6645 | 0.6104 | −0.0541 |
+| 3D Dice — per patient | 0.1992 | **0.4565** | **+0.2573** |
+| 3D Dice — per nodule | 0.6935 | 0.5928 | −0.1007 |
+| False alarms on tumour-free slices | 54.2% | **6.7%** | **−47.5 pts** |
+
+![Post-Processing Impact](charts/postprocessing_impact.png)
+
+Tumour Dice was traded deliberately. Under the metric decomposition in §4.1, giving up 0.054 of tumour Dice to remove 47 points of false-alarm rate is a favourable exchange by a wide margin.
 
 ---
 
-## 5. Experimental Results & Architecture Comparisons
+### 5.4 Training Convergence
 
-We benchmarked **9 distinct model configurations** across 40 epochs. All final evaluation experiments were conducted on the patient-level, reproducibly seeded test split (23,622 2D slices across 101 test CT scans; 80/10/10 split with `seed=42`).
+Checkpoints were saved at peak **composite score** — $(\text{Dice} + \text{Sensitivity} + \text{Precision})/3$ — computed on validation tumour slices.
 
-### 5.1 Parameter Validation Sweeps & Operating Point Selection
+| Model | Peak Epoch | Val Dice (tumour) | Composite |
+|---|---|---|---|
+| Attention UNet 2.5D | 29 | 0.7241 | 0.7399 |
+| SegResNet 2.5D | 20 | 0.6969 | 0.7139 |
+| SegResNet 2D | 25 | 0.6601 | 0.6746 |
+| UNet 2.5D | 31 | 0.6471 | 0.6670 |
+| Attention UNet 2D | 27 | 0.6425 | 0.6576 |
+| UNet 2D (DiceFocal) | 26 | 0.5770 | 0.5952 |
+| UNet 2D (DiceCE) | 27 | 0.5623 | 0.5774 |
+| UNet 2D (TverskyFocal) | 21 | 0.5348 | 0.5635 |
+| UNet 2D (No Aug) | 7 | 0.3623 | 0.3965 |
 
-Before conducting full test-set model benchmark evaluations, we performed systematic hyperparameter sweeps strictly on the **validation split** (`val` split; not on the held-out test split) to establish the optimal post-processing and binarization operating points. We evaluated two parameters independently:
-1. **Connected Component Noise Filter (`--min_size`):** Evaluated at 0, 5, 10, and 15 pixels (holding default threshold = 0.5).
-2. **Binarization Probability Threshold (`--threshold`):** Evaluated at 0.25, 0.50, 0.75, 0.90, and 0.95 (holding default min_size = 10px).
+![Training Curves](charts/training_curves_top4.png)
 
-#### Validation Sweep Results
-
-**A) Min Size Component Filter Sweep (`threshold = 0.5`)**
-
-| Min Component Size | 2D Tumor Dice | Precision | Sensitivity | 2D Slice FA % | 3D Patient FA % |
-|---|---|---|---|---|---|
-| **0 px (Raw)** | **0.5770** | **0.6229** | **0.5857** | 74.9% | 18.8% |
-| **5 px** | 0.5748 | 0.6194 | 0.5822 | 58.1% | 18.8% |
-| **10 px (Selected)** | 0.5577 | 0.6002 | 0.5627 | **36.3%** | 18.8% |
-| **15 px** | 0.4997 | 0.5387 | 0.4999 | 20.6% | 18.8% |
-
-**B) Probability Binarization Threshold Sweep (`min_size = 10px`)**
-
-| Binarization Threshold | 2D Tumor Dice | Precision | Sensitivity | 2D Slice FA % | 3D Patient FA % |
-|---|---|---|---|---|---|
-| **0.25** | **0.5767** | 0.5599 | **0.6520** | 61.6% | 18.8% |
-| **0.50 (Selected)** | 0.5577 | **0.6002** | 0.5627 | 36.3% | 18.8% |
-| **0.75** | 0.4836 | 0.5805 | 0.4408 | 18.5% | 18.8% |
-| **0.90** | 0.3803 | 0.5073 | 0.3193 | 8.8% | 18.8% |
-| **0.95** | 0.3090 | 0.4524 | 0.2459 | 5.3% | 18.8% |
-
-![Post-Processing Threshold Sensitivity](charts/postprocessing_threshold_sensitivity.png)
-
-#### Decision Rationale & Standardized Operating Point Selection
-- **Noise Suppression vs. Recall:** Setting `min_size = 10px` slashes the 2D slice false alarm rate from **74.9%** (raw) down to **36.3%** while preserving ~96% of valid tumor slice recall.
-- **Precision Balance:** Choosing `threshold = 0.5` provides the optimal clinical balance between sensitivity (0.5627) and precision (0.6002). Lowering threshold to 0.25 increases raw Dice slightly (0.5767) but triggers a massive jump in false alarms (61.6%). Raising threshold to 0.75 severely degrades Dice (0.4836).
-- **Standardized Configuration:** **Based on these validation sweep conclusions, we selected `threshold = 0.5` and `min_size = 10px` as our standard operating parameters.** All subsequent model training evaluations, test-set benchmarks, loss function comparisons, and architectural ablation studies in the following sections utilize this configuration.
+> [!NOTE]
+> This criterion is computed on **tumour slices only**, so checkpoint selection was blind to false positives on background slices. A model that fires readily scores well here. This is a known limitation of the current training loop, not a result.
 
 ---
 
-### 5.2 Training Convergence Summary (Peak Validation Metrics at Best Checkpoint)
-
-During training, model checkpoints (`.pth`) are automatically saved whenever a run achieves a new **Peak Composite Score** ($\frac{\text{Dice} + \text{Sensitivity} + \text{Precision}}{3.0}$). The table below compares all 9 models evaluated at their respective **peak validation checkpoint epochs**:
-
-| Model Architecture | Input Dim | Loss Function | Peak Epoch | Val Dice | Val IoU | Precision | Sensitivity | Specificity | Composite Score |
-|---|---|---|---|---|---|---|---|---|---|
-| **Attention UNet 2.5D** | 2.5D | DiceFocal | Ep 29 | **0.7241** | **0.6137** | **0.7237** | **0.7720** | 0.9999 | **0.7399** |
-| **SegResNet 2.5D** | 2.5D | DiceFocal | Ep 20 | 0.6969 | 0.5861 | 0.7233 | 0.7214 | 0.9998 | 0.7139 |
-| **SegResNet 2D** | 2D | DiceFocal | Ep 25 | 0.6601 | 0.5574 | 0.6820 | 0.6816 | 0.9998 | 0.6746 |
-| **UNet 2.5D** | 2.5D | DiceFocal | Ep 31 | 0.6471 | 0.5369 | 0.6699 | 0.6840 | 0.9998 | 0.6670 |
-| **Attention UNet 2D** | 2D | DiceFocal | Ep 27 | 0.6425 | 0.5444 | 0.6487 | 0.6818 | 0.9998 | 0.6576 |
-| **UNet 2D (DiceFocal)** | 2D | DiceFocal | Ep 26 | 0.5770 | 0.4818 | 0.6229 | 0.5857 | 0.9998 | 0.5952 |
-| **UNet 2D (DiceCE)** | 2D | DiceCE | Ep 27 | 0.5623 | 0.4648 | 0.5793 | 0.5908 | 0.9998 | 0.5774 |
-| **UNet 2D (TverskyFocal)**| 2D | TverskyFocal | Ep 21 | 0.5348 | 0.4272 | 0.4794 | 0.6762 | 0.9997 | 0.5635 |
-| **UNet 2D (No Aug)** | 2D | DiceFocal | Ep 07 | 0.3623 | 0.2753 | 0.3410 | 0.4863 | 0.9996 | 0.3965 |
-
-![Validation Dice Comparison](charts/validation_dice_comparison.png)
-
-![Training Curves Top Architectures](charts/training_curves_top4.png)
-
----
-
-### 5.3 Test Set Evaluation Results (Post-Processed with `--threshold 0.5` and `--min_size 10`)
-
-Evaluating the saved best model checkpoints on the held-out **Test Set** (23,622 total test slices: 1,395 tumor-positive slices, 22,227 background slices, 186 distinct 3D nodules). Predictions are post-processed with connected component noise filtering (`--min_size 10` pixels) and probability thresholding (`--threshold 0.5`):
-
-| Model Architecture | Input Dim | 2D Tumor Slice Dice | 2D Precision | 2D Sensitivity | 2D Slice FA % | 3D Nodule Lesion Dice | 3D Nodule Precision | 3D Nodule Failure % |
-|---|---|---|---|---|---|---|---|---|
-| **Attention UNet 2.5D** | 2.5D | **0.6645** | **0.6880** | **0.6911** | 54.2% | **0.6935** | **0.7639** | **8.6%** |
-| **SegResNet 2.5D** | 2.5D | 0.6497 | 0.6918 | 0.6516 | 50.4% | 0.6384 | 0.7450 | 12.9% |
-| **Attention UNet 2D** | 2D | 0.6292 | 0.6486 | 0.6497 | 62.2% | 0.6617 | 0.7448 | 12.4% |
-| **UNet 2.5D** | 2.5D | 0.6154 | 0.6413 | 0.6359 | 40.3% | 0.6189 | 0.7029 | 15.1% |
-| **SegResNet 2D** | 2D | 0.5981 | 0.6336 | 0.6062 | 55.2% | 0.6318 | 0.7269 | 15.1% |
-| **UNet 2D (DiceCE)** | 2D | 0.5600 | 0.5757 | 0.5892 | 49.0% | 0.5875 | 0.6852 | 17.2% |
-| **UNet 2D (DiceFocal)** | 2D | 0.5510 | 0.5981 | 0.5512 | **38.5%** | 0.5819 | 0.7090 | 18.3% |
-| **UNet 2D (TverskyFocal)**| 2D | 0.5490 | 0.5083 | 0.6636 | 76.6% | 0.6284 | 0.6753 | 13.4% |
-| **UNet 2D (No Aug)** | 2D | 0.3601 | 0.3396 | 0.4730 | 42.1% | 0.4363 | 0.5051 | 36.0% |
-
----
-
-### 5.4 Comparison: Loss Functions (DiceFocal vs. DiceCE vs. TverskyFocal)
-
-We evaluated 3 distinct loss function formulations on the 2D UNet architecture:
-1. **DiceFocal Loss:** Achieves the cleanest precision-to-false-alarm trade-off, recording the lowest 2D slice false alarm rate (**38.5%**) and highest 2D precision (**0.5981**).
-2. **DiceCE Loss:** Yields **0.5600** 2D Tumor Dice and **0.5875** 3D Nodule Dice, providing stable cross-entropy pixel classification.
-3. **TverskyFocal Loss ($\alpha=0.3, \beta=0.7, \gamma=2.0$):** Emphasizes false-negative penalties ($\beta=0.7$). It boosts 2D Sensitivity to **0.6636** (vs 0.5512 for DiceFocal) and 3D Nodule Dice to **0.6284** (vs 0.5819 for DiceFocal). Crucially, TverskyFocal excels on **Small Nodules (<100 voxels)**, reaching **0.5443** 3D Dice (compared to 0.4678 for DiceFocal).
+### 5.5 Comparison: Loss Functions (UNet 2D)
 
 ![Loss Function Comparison](charts/loss_function_comparison.png)
 
+| Loss | 2D Dice (tumour) | 3D Dice (nodule) | Small-nodule Dice |
+|---|---|---|---|
+| **DiceFocal** | **0.5451** | **0.5112** | 0.3705 |
+| DiceCE | 0.4829 | 0.4842 | **0.3808** |
+| TverskyFocal | 0.4677 | 0.4522 | 0.3011 |
+
+DiceFocal leads on tumour and per-nodule Dice. DiceCE edges it out on the smallest lesions.
+
 ---
 
-### 5.5 Comparison: Data Augmentation Impact (With Aug vs. No Aug)
-
-Training without MONAI spatial and intensity augmentations (`--no_transforms`) leads to severe overfitting:
-- **Peak Validation Dice:** Reaches a peak of **0.3623** at Epoch 07 before deteriorating down to **0.0803** by Epoch 40 (vs. **0.5770** for augmented UNet).
-- **Validation Failure Rate:** Escalates to **38.4%** at peak and **89.4%** at epoch 40 on non-augmented runs.
-- **Conclusion:** Data augmentation (random affine rotation, scaling, Gaussian noise/blur) is strictly necessary to prevent spatial overfitting on cropped 256x256 CT slices.
+### 5.6 Comparison: Data Augmentation
 
 ![Augmentation Impact](charts/augmentation_impact.png)
 
+| Metric | With augmentation | Without augmentation |
+|---|---|---|
+| 2D Dice — tumour slices | **0.5451** | 0.2054 |
+| 3D Dice — per nodule | **0.5112** | 0.1825 |
+| Nodule failure rate | **35.5%** | 74.2% |
+| 2D Dice — all slices | 0.9211 | *0.9432* |
+
+Removing augmentation causes the validation curve to peak at epoch 7 and decay steadily thereafter — textbook overfitting. It also produces the clearest illustration of why a single metric is not enough: **the un-augmented model scores higher on all-slice Dice while being drastically worse at the actual task.**
+
 ---
 
-### 5.6 Comparison: 2D vs. 2.5D Spatial Context
-
-2.5D models stack 3 adjacent CT slices `[z-1, z, z+1]` as a 3-channel input to provide inter-slice volumetric context:
-
-| Architecture | 2D Peak Val Dice | 2.5D Peak Val Dice | 2D Test Dice | 2.5D Test Dice | 2.5D Performance Gain |
-|---|---|---|---|---|---|
-| **Attention UNet** | 0.6425 | **0.7241** | 0.6292 | **0.6645** | **+0.0816 Val / +0.0353 Test** |
-| **SegResNet** | 0.6601 | **0.6969** | 0.5981 | **0.6497** | **+0.0368 Val / +0.0516 Test** |
-| **UNet** | 0.5770 | **0.6471** | 0.5510 | **0.6154** | **+0.0701 Val / +0.0644 Test** |
+### 5.7 Comparison: 2D vs. 2.5D Spatial Context
 
 ![2D vs 2.5D Comparison](charts/2d_vs_25d_comparison.png)
 
+| Architecture | 2D tumour Dice | 2.5D tumour Dice | Δ | 2D nodule Dice | 2.5D nodule Dice | Δ |
+|---|---|---|---|---|---|---|
+| UNet | 0.5451 | 0.5873 | **+0.042** | 0.5112 | 0.5483 | **+0.037** |
+| Attention UNet | 0.5711 | 0.6104 | **+0.039** | 0.5587 | 0.5928 | **+0.034** |
+| SegResNet | 0.5612 | 0.6106 | **+0.049** | 0.5299 | 0.5736 | **+0.044** |
+
+Stacking three adjacent slices helps every architecture, on both metrics, by a consistent 0.03–0.05.
+
 ---
 
-### 5.7 Comparison: Model Architecture (UNet vs. Attention UNet vs. SegResNet)
+### 5.8 Comparison: Model Architecture
 
-- **Top Performers:** **Attention UNet 2.5D** (Peak Val Dice: **0.7241**, Test 3D Nodule Dice: **0.6935**, Test 3D Precision: **0.7639**) leads overall performance across all benchmarked configurations.
-- **Attention Gating:** Attention gates filter out non-salient background signals along skip connections, significantly reducing false positive slice rates while sharpening boundary precision.
-- **2.5D Spatial Context:** Incorporating 3 adjacent CT slices uniformly boosts performance across UNet (+0.0701), Attention UNet (+0.0816), and SegResNet (+0.0368) peak validation Dice scores.
+Within 2.5D, **Attention UNet** and **SegResNet** are level on tumour Dice (0.6104 vs 0.6106), with Attention UNet ahead on per-nodule Dice (0.5928 vs 0.5736) and lesion recovery (27.4% vs 28.0% failure). Within 2D, Attention UNet leads on tumour Dice (0.5711) and per-nodule Dice (0.5587).
+
+Attention gating and 2.5D context are complementary: **Attention UNet 2.5D** has the best per-nodule Dice and the lowest lesion failure rate of any configuration tested.
 
 ---
 
-### 5.8 Nodule Size Stratification Analysis
-
-3D nodule detection performance across volumetric size categories on the Test Set (186 total 3D nodule lesions):
-
-| Model Architecture | All Nodules Dice (Count: 186) | Small Nodules Dice (<100 voxels, Count: 93) | Medium Nodules Dice (100-1000 voxels, Count: 75) | Large Nodules Dice ($\ge$1000 voxels, Count: 18) |
-|---|---|---|---|---|
-| **Attention UNet 2.5D** | **0.6935** | **0.6117** | **0.7819** | 0.7477 |
-| **SegResNet 2.5D** | 0.6384 | 0.5109 | 0.7621 | **0.7815** |
-| **Attention UNet 2D** | 0.6617 | 0.5586 | 0.7699 | 0.7430 |
-| **UNet 2D (TverskyFocal)**| 0.6284 | 0.5443 | 0.7142 | 0.7055 |
-| **UNet 2.5D** | 0.6189 | 0.5132 | 0.7298 | 0.7027 |
-| **SegResNet 2D** | 0.6318 | 0.5160 | 0.7543 | 0.7195 |
-| **UNet 2D (DiceCE)** | 0.5875 | 0.4634 | 0.7096 | 0.7206 |
-| **UNet 2D (DiceFocal)** | 0.5819 | 0.4678 | 0.7017 | 0.6729 |
-| **UNet 2D (No Aug)** | 0.4363 | 0.3211 | 0.5593 | 0.5184 |
+### 5.9 Nodule Size Stratification
 
 ![Nodule Size Stratification](charts/nodule_size_stratification.png)
+
+| Model | Small (<100 vox, n=93) | Medium (100–1000, n=75) | Large (≥1000, n=18) |
+|---|---|---|---|
+| **Attention UNet 2.5D** | **0.4957** | **0.7105** | 0.6043 |
+| SegResNet 2.5D | 0.4529 | 0.6961 | **0.6866** |
+| Attention UNet 2D | 0.4540 | 0.6640 | 0.6608 |
+| UNet 2.5D | 0.4039 | 0.7035 | 0.6476 |
+| SegResNet 2D | 0.3578 | 0.7174 | 0.6379 |
+| UNet 2D (DiceFocal) | 0.3705 | 0.6488 | 0.6650 |
+
+Small nodules remain by far the hardest category and hold the largest headroom.
 
 ---
 
@@ -382,15 +451,29 @@ python training/train.py \
 ```
 
 #### Step 3: Model Evaluation on Test Split
-Evaluate a trained model checkpoint on the held-out test split using the standardized operating point (`--threshold 0.5`, `--min_size 10`):
+Evaluate a trained checkpoint on the held-out test split at its validation-selected operating point (see §5.1 for the per-model values):
 ```bash
 python evaluation/evaluate_2_5d.py \
     --model_path models/attention_unet_2.5d/attention_unet_2.5d.pth \
     --split test \
     --threshold 0.5 \
-    --min_size 10 \
+    --min_voxels_3d 35 \
+    --min_peak_prob 0.997 \
+    --max_elongation 2.5 \
+    --tta 1 \
     --report_path model_evals/attention_unet_2.5d/test_evaluation_report.txt
 ```
+
+To reproduce every model's test report at its selected operating point in one pass:
+```bash
+./run_test_evaluations.sh
+```
+
+#### Step 4: Regenerate the README Charts
+```bash
+python scripts/generate_readme_charts.py
+```
+Reads `model_evals/<model>/test_evaluation_report.txt`, `model_evals/val_operating_point_grid.csv` and `models/<model>/train.txt`, and rewrites every figure in `charts/`.
 
 ---
 
@@ -402,7 +485,8 @@ An interactive Tkinter GUI application for exploring 2D model predictions slice-
 python visualization/visualize_patient_interactive.py \
     --model_path models/attention_unet/attention_unet.pth \
     --patient_id LIDC-IDRI-0002 \
-    --min_size 10
+    --min_voxels_3d 35 \
+    --min_peak_prob 0.997
 ```
 
 ### 7.2 Interactive 2.5D Slice Visualizer (`visualization/visualize_patient_interactive_2_5d.py`)
@@ -411,7 +495,8 @@ Interactive slice visualizer designed specifically for 3-channel 2.5D multi-slic
 python visualization/visualize_patient_interactive_2_5d.py \
     --model_path models/attention_unet_2.5d/attention_unet_2.5d.pth \
     --patient_id LIDC-IDRI-0002 \
-    --min_size 10
+    --min_voxels_3d 35 \
+    --min_peak_prob 0.997
 ```
 
 ### 7.3 Dataset Analytics Visualizer (`visualization/visualize_dataset.py`)

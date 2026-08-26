@@ -2,6 +2,8 @@
 # Datasets & Large Data Directories
 # ==========================================
 scripts/
+old/
+reports/
 *.zip
 
 # Medical Imaging Data & Slice Files
@@ -9,6 +11,8 @@ scripts/
 *.nii
 *.nii.gz
 *.npz
+*.sh
+*.bat
 
 # ==========================================
 # Python & Virtual Environments
@@ -36,3 +40,8 @@ dist/
 .idea/
 .DS_Store
 Thumbs.db
+
+# ==========================================
+# Claude analysis workspace (scripts + dumps)
+# ==========================================
+claude_work/
