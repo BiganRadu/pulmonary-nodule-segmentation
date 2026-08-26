@@ -479,25 +479,56 @@ Reads `model_evals/<model>/test_evaluation_report.txt`, `model_evals/val_operati
 
 ## 7. Interactive Visualization Tools
 
+Both interactive visualizers apply the **same four-stage post-processing pipeline as
+`evaluation/`** (§4.2) — probability threshold, 3D component size, peak-probability
+gate, and elongation shape filter — and support the same 4-flip test-time
+augmentation. What the GUI draws is therefore what the reported metrics measure.
+
+One difference is handled automatically. The evaluator gates on the 256×256 grid,
+whereas the visualizers interpolate predictions back to the patient's native 1 mm
+crop, where a component contains roughly 1.8× more voxels. `--min_voxels_3d` is
+therefore rescaled by the actual area ratio so the same value means the same physical
+size in both tools; the adjustment is printed at startup:
+
+```
+min_voxels_3d 35 (256 grid) -> 74 on this patient's 369x375 native grid
+```
+
+Elongation needs no such correction — it is measured in millimetres, and the native
+npz grid is 1 mm isotropic after preprocessing.
+
 ### 7.1 Interactive 2D Slice Visualizer (`visualization/visualize_patient_interactive.py`)
-An interactive Tkinter GUI application for exploring 2D model predictions slice-by-slice alongside ground-truth masks:
+An interactive GUI for exploring 2D model predictions slice-by-slice alongside
+ground-truth masks. Invoked here at `attention_unet`'s tuned operating point (§5.1):
 ```bash
 python visualization/visualize_patient_interactive.py \
     --model_path models/attention_unet/attention_unet.pth \
     --patient_id LIDC-IDRI-0002 \
-    --min_voxels_3d 35 \
-    --min_peak_prob 0.997
+    --threshold 0.6 \
+    --min_voxels_3d 15 \
+    --min_peak_prob 0.997 \
+    --max_elongation 3.0 \
+    --tta 1
 ```
 
 ### 7.2 Interactive 2.5D Slice Visualizer (`visualization/visualize_patient_interactive_2_5d.py`)
-Interactive slice visualizer designed specifically for 3-channel 2.5D multi-slice predictions:
+Interactive slice visualizer for 3-channel 2.5D multi-slice predictions, at
+`attention_unet_2.5d`'s tuned operating point:
 ```bash
 python visualization/visualize_patient_interactive_2_5d.py \
     --model_path models/attention_unet_2.5d/attention_unet_2.5d.pth \
     --patient_id LIDC-IDRI-0002 \
+    --threshold 0.5 \
     --min_voxels_3d 35 \
-    --min_peak_prob 0.997
+    --min_peak_prob 0.997 \
+    --max_elongation 2.5 \
+    --tta 1
 ```
+
+The active filter chain is shown in the prediction panel title, e.g.
+`≥35 voxels, peak ≥0.997, elong ≤2.5, 4-flip TTA`. Setting `--max_elongation 0`
+disables the shape filter and `--tta 0` disables test-time augmentation, which is
+useful for seeing what each stage removes.
 
 ### 7.3 Dataset Analytics Visualizer (`visualization/visualize_dataset.py`)
 Generates exploratory dataset distribution plots for slice thickness, HU histograms, and nodule volume distributions:

@@ -33,6 +33,7 @@ from scipy.ndimage import label, find_objects
 # Local imports
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 from training.train import get_model
+from evaluation.evaluate import component_elongation
 
 # Default Configuration Constants
 DEFAULT_PATIENT_ID = "LIDC-IDRI-0035"
@@ -40,23 +41,31 @@ DEFAULT_MANIFEST = "preprocessed_data/dataset_manifest.csv"
 DEFAULT_MODEL_PATH = "models/unet/unet.pth"
 DEFAULT_MIN_VOXELS_3D = 15
 DEFAULT_MIN_PEAK_PROB = 0.0
+DEFAULT_MAX_ELONGATION = 2.5
+DEFAULT_TTA = 0
 DEFAULT_THRESHOLD = 0.5
 
 
-def remove_small_objects_3d(vol_binary, min_voxels=15, vol_prob=None, min_peak_prob=0.0):
+def remove_small_objects_3d(vol_binary, min_voxels=15, vol_prob=None, min_peak_prob=0.0,
+                            max_elongation=0.0, spacing=(1.0, 1.0, 1.0)):
     """
     Applies 3D connected-component labeling on full 3D CT volume (26-connectivity).
     - Removes any 3D connected component with volume < min_voxels.
     - If min_peak_prob > 0 (and vol_prob is supplied): removes 3D components whose PEAK sigmoid
       probability never reaches min_peak_prob.
+    - If max_elongation > 0: removes 3D components more elongated than that (tubular vessels),
+      measured in millimetres via `spacing`.
+
+    Mirrors evaluation/evaluate.py so the picture matches the reported metrics.
     """
     if np.sum(vol_binary) == 0:
         return vol_binary
 
     use_peak_gate = (min_peak_prob > 0.0 and vol_prob is not None)
+    use_shape_gate = (max_elongation > 0.0)
 
-    # Step 1: 3D Connected-Component Size & Peak-Confidence Filtering
-    if min_voxels > 0 or use_peak_gate:
+    # Step 1: 3D Connected-Component Size, Peak-Confidence & Shape Filtering
+    if min_voxels > 0 or use_peak_gate or use_shape_gate:
         labeled_mask, num_features = label(vol_binary, structure=np.ones((3, 3, 3), dtype=bool))
         if num_features == 0:
             return vol_binary
@@ -73,6 +82,9 @@ def remove_small_objects_3d(vol_binary, min_voxels=15, vol_prob=None, min_peak_p
             np.maximum.at(comp_peak, flat_labels[fg], vol_prob.ravel()[fg].astype(np.float32))
             too_small |= (comp_peak < min_peak_prob)
 
+        if use_shape_gate:
+            too_small |= (component_elongation(labeled_mask, num_features, spacing) > max_elongation)
+
         too_small[0] = False  # Ensure background is never removed
         cleaned_vol = vol_binary.copy()
         cleaned_vol[too_small[labeled_mask]] = False
@@ -80,6 +92,27 @@ def remove_small_objects_3d(vol_binary, min_voxels=15, vol_prob=None, min_peak_p
         cleaned_vol = vol_binary.copy()
 
     return cleaned_vol
+
+
+def predict_probs(model, images, tta=False):
+    """
+    Sigmoid probabilities for a batch. With tta=True the prediction is averaged over the
+    4 horizontal/vertical flip combinations, each flip undone before accumulating.
+    Training used RandFlipd on both spatial axes, so these views are in-distribution.
+
+    Mirrors evaluation/evaluate.py.
+    """
+    views = [()] if not tta else [(), (2,), (3,), (2, 3)]
+    acc = None
+    for dims in views:
+        x = torch.flip(images, dims) if dims else images
+        logits = model(x)
+        p = torch.sigmoid(logits.float())
+        if dims:
+            p = torch.flip(p, dims)
+        acc = p if acc is None else acc + p
+    return acc / len(views)
+
 
 def compute_slice_dice(pred_mask, gt_mask):
     """
@@ -169,7 +202,7 @@ def load_trained_model(model_path, device):
 
 class PatientSliceVisualizer:
     def __init__(self, patient_df, model, device, patient_id, min_voxels_3d=15,
-                 threshold=0.5, min_peak_prob=0.0):
+                 threshold=0.5, min_peak_prob=0.0, max_elongation=0.0, tta=False):
         self.patient_df = patient_df
         self.model = model
         self.device = device
@@ -177,12 +210,18 @@ class PatientSliceVisualizer:
         self.min_voxels_3d = min_voxels_3d
         self.threshold = threshold
         self.min_peak_prob = min_peak_prob
+        self.max_elongation = max_elongation
+        self.tta = tta
         self.total_slices = len(patient_df)
         self.current_idx = 0
 
         filter_parts = [f"≥{min_voxels_3d} voxels"]
         if min_peak_prob > 0.0:
             filter_parts.append(f"peak ≥{min_peak_prob:g}")
+        if max_elongation > 0.0:
+            filter_parts.append(f"elong ≤{max_elongation:g}")
+        if tta:
+            filter_parts.append("4-flip TTA")
         self.filter_str = ", ".join(filter_parts)
 
         print(f"\nPre-computing predictions for all {self.total_slices} slices of patient {patient_id} (3D Filter: {self.filter_str}, Threshold: {threshold})...")
@@ -208,11 +247,11 @@ class PatientSliceVisualizer:
                 img_tensor = torch.from_numpy(img).unsqueeze(0).to(device)  # (1, 1, H, W)
                 img_resized = F.interpolate(img_tensor, size=(256, 256), mode='bilinear', align_corners=False)
 
-                logits_resized = model(img_resized)
+                prob_resized = predict_probs(model, img_resized, tta=self.tta)
 
-                # Interpolate prediction back to original (H, W) resolution
-                logits = F.interpolate(logits_resized, size=orig_shape, mode='bilinear', align_corners=False)
-                prob = torch.sigmoid(logits.float()).squeeze().cpu().numpy().astype(np.float32)
+                # Interpolate the probability back to original (H, W) resolution
+                prob_t = F.interpolate(prob_resized, size=orig_shape, mode='bilinear', align_corners=False)
+                prob = prob_t.squeeze().cpu().numpy().astype(np.float32)
 
                 self.images.append(img.squeeze())
                 self.gt_masks.append(gt.squeeze())
@@ -228,12 +267,22 @@ class PatientSliceVisualizer:
         # Assemble full 3D probability volume, binarize and apply 3D Volumetric Filtering + Peak-Confidence Gate
         vol_prob = np.stack(raw_probs, axis=-1)
         vol_pred = vol_prob > self.threshold
-        if (self.min_voxels_3d > 0 or self.min_peak_prob > 0.0) and np.sum(vol_pred) > 0:
+        # The evaluator gates on the 256x256 grid; here the volume is at the patient's
+        # native 1mm crop, so a component holds more voxels. Rescale by the area ratio
+        # so the same --min_voxels_3d means the same physical size in both tools.
+        area_ratio = (vol_prob.shape[0] * vol_prob.shape[1]) / (256.0 * 256.0)
+        min_vox_here = int(round(self.min_voxels_3d * area_ratio))
+        if min_vox_here != self.min_voxels_3d:
+            print(f"  min_voxels_3d {self.min_voxels_3d} (256 grid) -> {min_vox_here} "
+                  f"on this patient's {vol_prob.shape[0]}x{vol_prob.shape[1]} native grid")
+        if (min_vox_here > 0 or self.min_peak_prob > 0.0 or self.max_elongation > 0.0) and np.sum(vol_pred) > 0:
             vol_pred = remove_small_objects_3d(
                 vol_pred,
-                min_voxels=self.min_voxels_3d,
+                min_voxels=min_vox_here,
                 vol_prob=vol_prob,
-                min_peak_prob=self.min_peak_prob
+                min_peak_prob=self.min_peak_prob,
+                max_elongation=self.max_elongation,
+                spacing=(1.0, 1.0, 1.0),   # npz grid is 1mm isotropic after preprocessing
             )
 
         self.pred_masks = [vol_pred[:, :, i].astype(np.float32) for i in range(self.total_slices)]
@@ -340,6 +389,10 @@ def main():
     parser.add_argument("--model_path", type=str, default=DEFAULT_MODEL_PATH, help=f"Path to trained model checkpoint (default: {DEFAULT_MODEL_PATH})")
     parser.add_argument("--min_voxels_3d", "--min_voxels", "--min_size", type=int, default=DEFAULT_MIN_VOXELS_3D, help=f"Minimum 3D connected component volume in voxels (default: {DEFAULT_MIN_VOXELS_3D})")
     parser.add_argument("--min_peak_prob", "--peak_gate", type=float, default=DEFAULT_MIN_PEAK_PROB, help=f"Keep a 3D connected component only if its peak sigmoid probability reaches this value (default: {DEFAULT_MIN_PEAK_PROB})")
+    parser.add_argument("--max_elongation", "--max_elong", type=float, default=DEFAULT_MAX_ELONGATION,
+                        help=f"Drop 3D components more elongated than this (sqrt(lambda1/lambda3) in mm); 0 disables (default: {DEFAULT_MAX_ELONGATION})")
+    parser.add_argument("--tta", type=int, default=DEFAULT_TTA,
+                        help=f"1 = average predictions over the 4 horizontal/vertical flips (default: {DEFAULT_TTA})")
     parser.add_argument("--threshold", type=float, default=DEFAULT_THRESHOLD, help=f"Probability threshold for binarizing predictions (default: {DEFAULT_THRESHOLD})")
 
     args = parser.parse_args()
@@ -354,7 +407,9 @@ def main():
         patient_df, model, device, patient_id,
         min_voxels_3d=args.min_voxels_3d,
         threshold=args.threshold,
-        min_peak_prob=args.min_peak_prob
+        min_peak_prob=args.min_peak_prob,
+        max_elongation=args.max_elongation,
+        tta=bool(args.tta),
     )
     plt.show()
 
