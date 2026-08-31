@@ -33,7 +33,8 @@ from scipy.ndimage import label, find_objects
 # Local imports
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 from training.train_2_5d import get_model
-from evaluation.evaluate_2_5d import component_elongation
+from evaluation.evaluate_2_5d import checkpoint_in_slices
+from evaluation.postprocess import component_elongation
 
 # Default Configuration Constants
 DEFAULT_PATIENT_ID = "LIDC-IDRI-0001"
@@ -156,7 +157,7 @@ def load_patient_slices(manifest_path, patient_id):
     return patient_df, patient_id
 
 
-def load_trained_model(model_path, device):
+def load_trained_model(model_path, device, in_channels=3):
     """
     Loads trained 2.5D MONAI model checkpoint (auto-detects UNet vs AttentionUnet vs SegResNet).
     """
@@ -170,7 +171,7 @@ def load_trained_model(model_path, device):
 
     if "model_type" in checkpoint:
         try:
-            model, _ = get_model(checkpoint["model_type"], in_channels=3)
+            model, _ = get_model(checkpoint["model_type"], in_channels=in_channels)
             model.load_state_dict(state_dict)
             model.eval()
             return model.to(device)
@@ -192,7 +193,7 @@ def load_trained_model(model_path, device):
 
     for m_type in ["unet", "attention_unet", "segresnet"]:
         try:
-            model, _ = get_model(m_type, in_channels=3)
+            model, _ = get_model(m_type, in_channels=in_channels)
             model.load_state_dict(state_dict)
             model.eval()
             return model.to(device)
@@ -203,12 +204,13 @@ def load_trained_model(model_path, device):
 
 
 class PatientSliceVisualizer25D:
-    def __init__(self, patient_df, model, device, patient_id, min_voxels_3d=35,
+    def __init__(self, patient_df, model, device, patient_id, in_slices=3, min_voxels_3d=35,
                  threshold=0.5, min_peak_prob=0.0, max_elongation=0.0, tta=False):
         self.patient_df = patient_df
         self.model = model
         self.device = device
         self.patient_id = patient_id
+        self.in_slices = int(in_slices)
         self.min_voxels_3d = min_voxels_3d
         self.threshold = threshold
         self.min_peak_prob = min_peak_prob
@@ -239,31 +241,28 @@ class PatientSliceVisualizer25D:
         with torch.no_grad():
             for idx, row in patient_df.iterrows():
                 z = int(row["slice_idx"])
-                z_prev = max(0, z - 1)
                 z_curr = z
-                z_next = min(max_z, z + 1)
+                # neighbours clamped at the volume borders, target slice in the middle
+                half = self.in_slices // 2
+                zs = [min(max(z + o, 0), max_z) for o in range(-half, half + 1)]
 
-                path_prev = slice_map.get(z_prev, slice_map[z_curr])
                 path_curr = slice_map[z_curr]
-                path_next = slice_map.get(z_next, slice_map[z_curr])
-
-                if not (os.path.exists(path_prev) and os.path.exists(path_curr) and os.path.exists(path_next)):
+                paths = [slice_map.get(k, path_curr) for k in zs]
+                if not all(os.path.exists(q) for q in paths):
                     continue
 
-                npz_prev = np.load(path_prev)
                 npz_curr = np.load(path_curr)
-                npz_next = np.load(path_next)
-
-                img_prev = npz_prev["image"].astype(np.float32)
                 img_curr = npz_curr["image"].astype(np.float32)
                 gt = npz_curr["mask"].astype(np.float32)
-                img_next = npz_next["image"].astype(np.float32)
 
-                img_3ch = np.concatenate([img_prev, img_curr, img_next], axis=0)  # (3, H, W)
+                stack = []
+                for q in paths:
+                    with np.load(q) as f:
+                        stack.append(f["image"].astype(np.float32))
+                img_nch = np.concatenate(stack, axis=0)          # (in_slices, H, W)
                 orig_shape = img_curr.shape[-2:]
 
-                # Resize input tensor to (256, 256) for UNet execution
-                img_tensor = torch.from_numpy(img_3ch).unsqueeze(0).to(device)  # (1, 3, H, W)
+                img_tensor = torch.from_numpy(img_nch).unsqueeze(0).to(device)
                 img_resized = F.interpolate(img_tensor, size=(256, 256), mode='bilinear', align_corners=False)
 
                 prob_resized = predict_probs(model, img_resized, tta=self.tta)
@@ -420,10 +419,13 @@ def main():
     print(f"Using Compute Device: {device}")
 
     patient_df, patient_id = load_patient_slices(args.manifest, args.patient_id)
-    model = load_trained_model(args.model_path, device)
+    in_slices = checkpoint_in_slices(args.model_path)
+    print(f"Checkpoint uses a {in_slices}-slice input window.")
+    model = load_trained_model(args.model_path, device, in_channels=in_slices)
 
     visualizer = PatientSliceVisualizer25D(
         patient_df, model, device, patient_id,
+        in_slices=in_slices,
         min_voxels_3d=args.min_voxels_3d,
         threshold=args.threshold,
         min_peak_prob=args.min_peak_prob,

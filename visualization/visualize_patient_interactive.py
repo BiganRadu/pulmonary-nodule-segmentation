@@ -33,7 +33,7 @@ from scipy.ndimage import label, find_objects
 # Local imports
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 from training.train import get_model
-from evaluation.evaluate import component_elongation
+from evaluation.postprocess import component_elongation
 
 # Default Configuration Constants
 DEFAULT_PATIENT_ID = "LIDC-IDRI-0035"
