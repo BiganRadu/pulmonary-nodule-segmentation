@@ -45,3 +45,5 @@ Thumbs.db
 # Claude analysis workspace (scripts + dumps)
 # ==========================================
 claude_work/
+preprocessed_data_u8/
+kaggle_upload/
