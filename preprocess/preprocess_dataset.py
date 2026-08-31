@@ -461,6 +461,36 @@ def crop_lung_cavity(norm_volume, hu_volume, consensus_mask, session_masks, spat
     return crop_vol, crop_con, crop_ses, spatial_meta
 
 
+def slice_nodule_volumes(consensus_mask):
+    """
+    Per-slice volume of the nodule each slice belongs to, in resampled voxels.
+
+    A nodule contributes one training sample per slice it spans, so a sampler that wants to
+    even out the small-nodule share needs to know how big the nodule on a slice actually is
+    in 3D. A slice's own tumour pixel count cannot tell a genuinely small nodule from the
+    end cap of a large one, so this labels the mask in 3D (26-connectivity) and records, for
+    each slice, the volume of the component it touches. Where a slice touches more than one
+    nodule, the largest wins.
+
+    Returns a dict {z: (slice_px, nodule_vox)} covering only slices with tumour.
+    """
+    out = {}
+    if consensus_mask is None or not np.any(consensus_mask):
+        return out
+    lab, n = label(consensus_mask > 0, structure=np.ones((3, 3, 3), dtype=bool))
+    if n == 0:
+        return out
+    sizes = np.bincount(lab.ravel(), minlength=n + 1)
+    for z in range(lab.shape[2]):
+        s = lab[:, :, z]
+        ids = np.unique(s[s > 0])
+        if ids.size == 0:
+            continue
+        big = ids[np.argmax(sizes[ids])]
+        out[z] = (int((s == big).sum()), int(sizes[big]))
+    return out
+
+
 def audit_nodule_volume(orig_consensus_mask, resampled_consensus_mask, orig_spacing, target_spacing):
     """
     Pipeline Step 8: Audit of Volume Modifications After Resampling
@@ -657,6 +687,8 @@ def process_single_patient(
     del recon_mask
 
     num_slices = crop_vol.shape[2]
+    # 3D nodule volume behind each slice, for size-aware sampling during training
+    nodule_vols = slice_nodule_volumes(crop_con)
     positive_slices = []
     negative_slices = []
     selected_slices = []
@@ -667,12 +699,14 @@ def process_single_patient(
         slice_sessions = crop_ses[:, :, :, z]  # 2D cropped session masks
 
         tumor_pixels = int(np.sum(slice_mask > 0))
+        nodule_vox = nodule_vols.get(z, (0, 0))[1]
 
         record = {
             'patient_id': clean_id,
             'slice_idx': z,
             'has_tumor': 1 if tumor_pixels > 0 else 0,
             'tumor_pixels': tumor_pixels,
+            'nodule_vox': nodule_vox,
             'image_slice': slice_img,
             'mask_slice': slice_mask,
             'session_slices': slice_sessions
@@ -712,6 +746,7 @@ def process_single_patient(
             'slice_idx': r['slice_idx'],
             'has_tumor': r['has_tumor'],
             'tumor_pixels': r['tumor_pixels'],
+            'nodule_vox': r['nodule_vox'],
             'num_radiologists': num_radiologists,
             'inter_annotator_dice': inter_annotator_dice,
             'v_orig_mm3': v_orig_mm3,
@@ -1008,6 +1043,14 @@ def main():
         os.makedirs(args.output_dir, exist_ok=True)
         df_manifest.to_csv(manifest_csv, index=False)
 
+        # Per-slice nodule volumes, as their own table for size-aware sampling. Projected
+        # from the manifest rather than recomputed, so the two can never disagree.
+        pos = df_manifest[df_manifest['nodule_vox'] > 0]
+        nodule_csv = os.path.join(args.output_dir, "slice_nodule_size.csv").replace("\\", "/")
+        pos[['patient_id', 'slice_idx', 'tumor_pixels', 'nodule_vox']].rename(
+            columns={'patient_id': 'pid', 'slice_idx': 'z', 'tumor_pixels': 'slice_px'}
+        ).to_csv(nodule_csv, index=False)
+
         num_pos_total = len(df_manifest[df_manifest['has_tumor'] == 1])
         num_neg_total = len(df_manifest[df_manifest['has_tumor'] == 0])
 
@@ -1018,6 +1061,7 @@ def main():
         print(f"Saved master dataset manifest to: {manifest_csv}")
         if all_audit_entries:
             print(f"Saved patient & series audit report to: {audit_csv}")
+        print(f"Saved per-slice nodule volumes to: {nodule_csv}")
         print(f"=======================================================\n")
 
 if __name__ == "__main__":
