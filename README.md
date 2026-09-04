@@ -387,7 +387,7 @@ by 3D Dice over all test patients.
 A grid of **43,200 configurations** — 6 probability thresholds × 10 minimum volumes ×
 10 peak gates × 6 elongation cuts, for each of the 12 models — was swept on the validation
 split (101 patients, 23,124 slices). The full grid is committed at
-[`new_model_evals/val_operating_point_grid.csv`](new_model_evals/val_operating_point_grid.csv).
+[`model_evals/val_operating_point_grid.csv`](model_evals/val_operating_point_grid.csv).
 
 Each model's operating point maximises **validation 3D Dice over all patients**, the same
 quantity the test tables report. No constraint or tumour-Dice floor is applied: because the
@@ -403,14 +403,14 @@ over-filtering and under-filtering on its own.
 | SegResNet 2.5D (3 sl) | 0.6 | 25 | 0.9999 | 2 |
 | UNet 2.5D (3 sl) | 0.5 | 35 | off | 2.5 |
 | Attention UNet 2D | 0.3 | 0 | 0.995 | 3 |
-| SegResNet 2D | 0.7 | 50 | 0.998 | 2.5 |
+| SegResNet 2D | 0.7 | 35 | off | 3 |
 | UNet 2D (DiceCE) | 0.4 | 35 | off | 3 |
 | UNet 2D (TverskyFocal) | 0.3 | 50 | 0.9999 | 2.5 |
 | UNet 2D (DiceFocal) | 0.5 | 15 | off | 4 |
 | UNet 2D (No Aug) | 0.3 | 0 | 0.99 | 2.5 |
 
 Chosen points are committed at
-[`new_model_evals/selected_operating_points.csv`](new_model_evals/selected_operating_points.csv).
+[`model_evals/selected_operating_points.csv`](model_evals/selected_operating_points.csv).
 
 > [!NOTE]
 > The peak gate lands anywhere from `off` to `0.9999` depending on the model. A network
@@ -435,7 +435,7 @@ point, with 4-flip TTA.
 | SegResNet 2.5D (3 sl) | 3 sl | 0.5397 | 0.5131 | 0.5085 | 0.4942 | 0.5950 | 36.0% |
 | UNet 2.5D (3 sl) | 3 sl | 0.5330 | 0.4914 | 0.4673 | 0.4900 | 0.4967 | 38.2% |
 | Attention UNet 2D | 2D | 0.5287 | 0.4597 | 0.4283 | 0.4305 | 0.5086 | 44.6% |
-| SegResNet 2D | 2D | 0.5201 | 0.4355 | 0.3725 | 0.4238 | 0.4681 | 51.6% |
+| SegResNet 2D | 2D | 0.4971 | 0.4962 | 0.4795 | 0.4757 | 0.5676 | 37.1% |
 | UNet 2D (DiceCE) | 2D | 0.4869 | 0.4309 | 0.3775 | 0.4072 | 0.4319 | 48.9% |
 | UNet 2D (TverskyFocal) | 2D | 0.4705 | 0.3964 | 0.3320 | 0.3631 | 0.4049 | 56.5% |
 | UNet 2D (DiceFocal) | 2D | 0.4385 | 0.4193 | 0.3950 | 0.3961 | 0.4193 | 43.5% |
@@ -514,12 +514,12 @@ un-augmented model scores **higher** on that column while missing most lesions.
 |---|---|---|---|---|
 | UNet | 0.4385 | 0.5330 | 0.5493 | **+0.1108** |
 | Attention UNet | 0.5287 | 0.5656 | 0.6012 | **+0.0725** |
-| SegResNet | 0.5201 | 0.5397 | 0.5846 | **+0.0645** |
+| SegResNet | 0.4971 | 0.5397 | 0.5846 | **+0.0875** |
 
 Adjacent-slice context helps every architecture on the headline metric, and **all three peak
 at 5 slices**. Where the gain arrives differs: UNet takes almost all of it in the first step
-(+0.095 from 1 to 3 slices, +0.016 from 3 to 5), Attention UNet gains about equally at each
-step (+0.037, +0.036), and SegResNet gains more from the second (+0.020, +0.045).
+(+0.095 from 1 to 3 slices, +0.016 from 3 to 5), while Attention UNet (+0.037, +0.036) and
+SegResNet (+0.043, +0.045) gain about equally at each step.
 
 ---
 
@@ -640,14 +640,14 @@ python training/train_2_5d.py \
 Evaluate a checkpoint at its validation-selected operating point (see §5.1):
 ```bash
 python evaluation/evaluate_2_5d.py \
-    --model_path new_models/attention_unet_2_5d_5l/attention_unet_2.5d.pth \
+    --model_path models/attention_unet_2_5d_5l/attention_unet_2.5d.pth \
     --split test \
     --threshold 0.5 \
     --min_voxels_3d 35 \
     --min_peak_prob 0.998 \
     --max_elongation 2.0 \
     --tta 1 \
-    --report_path new_model_evals/attention_unet_2_5d_5l/test_report.txt
+    --report_path model_evals/attention_unet_2_5d_5l/test_report.txt
 ```
 
 The evaluator reads the slice window from the checkpoint, so the same command works for 3-
@@ -680,7 +680,7 @@ An interactive GUI for exploring 2D model predictions slice-by-slice alongside
 ground-truth masks. Invoked here at Attention UNet 2D's tuned operating point (§5.1):
 ```bash
 python visualization/visualize_patient_interactive.py \
-    --model_path new_models/attention_unet_2d/attention_unet_2d.pth \
+    --model_path models/attention_unet_2d/attention_unet_2d.pth \
     --patient_id LIDC-IDRI-0002 \
     --threshold 0.3 \
     --min_voxels_3d 0 \
@@ -695,7 +695,7 @@ from the checkpoint, so the same command works for 3- and 5-slice models. Shown 
 leading model's tuned operating point:
 ```bash
 python visualization/visualize_patient_interactive_2_5d.py \
-    --model_path new_models/attention_unet_2_5d_5l/attention_unet_2.5d.pth \
+    --model_path models/attention_unet_2_5d_5l/attention_unet_2.5d.pth \
     --patient_id LIDC-IDRI-0002 \
     --threshold 0.5 \
     --min_voxels_3d 35 \
